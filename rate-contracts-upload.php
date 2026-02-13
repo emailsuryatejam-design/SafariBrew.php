@@ -87,11 +87,12 @@ if (filesize($targetPath) > $maxSize) {
 
 $fileUrl = BASE_URL . '/uploads/contracts/' . $uniqueName;
 
-// Get extraction mode and contract type from form data
-$extractionMode = $_POST['extraction_mode'] ?? 'manual';
-$propertyName = $_POST['property_name'] ?? pathinfo($file['name'], PATHINFO_FILENAME);
+// Get extraction mode from form data — all other fields are optional (AI extracts them)
+$extractionMode = $_POST['extraction_mode'] ?? 'ai_brew';
+$rawName = pathinfo($file['name'], PATHINFO_FILENAME);
+$propertyName = !empty($_POST['property_name']) ? $_POST['property_name'] : preg_replace('/[_-]+/', ' ', $rawName);
 $accommodationId = !empty($_POST['accommodation_id']) ? (int)$_POST['accommodation_id'] : null;
-$contractType = $_POST['contract_type'] ?? 'STO';
+$contractType = !empty($_POST['contract_type']) ? $_POST['contract_type'] : null;
 
 // Create the contract record
 $code = generateCode('RCT', $pdo, 'rate_contracts', 'contract_code');
