@@ -1,0 +1,19 @@
+# Secrets
+.env.php
+
+# Uploads
+uploads/
+
+# Composer
+vendor/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
