@@ -446,15 +446,24 @@ PROMPT;
     $parsed = json_decode($content, true);
 
     if (json_last_error() !== JSON_ERROR_NONE) {
+        // Try markdown-fenced JSON
         if (preg_match('/```(?:json)?\s*([\s\S]+?)\s*```/', $content, $m)) {
             $parsed = json_decode($m[1], true);
         }
+        // Try extracting outermost JSON object
         if (json_last_error() !== JSON_ERROR_NONE) {
             if (preg_match('/\{[\s\S]+\}/', $content, $m)) {
                 $parsed = json_decode($m[0], true);
             }
         }
+        // Try repairing common JSON issues (trailing commas, unescaped newlines)
         if (json_last_error() !== JSON_ERROR_NONE) {
+            $repaired = repairJson($content);
+            $parsed = json_decode($repaired, true);
+        }
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            // Save raw response for debugging
+            echo "RAW GEMINI RESPONSE (first 2000 chars):\n" . substr($content, 0, 2000) . "\n";
             throw new Exception('Invalid JSON from Gemini: ' . json_last_error_msg());
         }
     }
@@ -543,4 +552,20 @@ function saveSection($pdo, $contractId, $table, $items, $fields) {
             $pdo->prepare($sql)->execute($values);
         }
     }
+}
+
+function repairJson($text) {
+    // Extract outermost JSON object
+    if (preg_match('/\{[\s\S]+\}/', $text, $m)) {
+        $text = $m[0];
+    }
+    // Remove trailing commas before } or ]
+    $text = preg_replace('/,\s*([\]}])/', '$1', $text);
+    // Fix unescaped control characters in strings
+    $text = preg_replace('/[\x00-\x1f](?=[^"]*"[^"]*(?:"[^"]*"[^"]*)*$)/', ' ', $text);
+    // Remove BOM
+    $text = preg_replace('/^\xEF\xBB\xBF/', '', $text);
+    // Fix common Gemini issue: numbers with currency symbols e.g. "$150" -> 150
+    // (only inside JSON values, not in string fields - skip this, too risky)
+    return $text;
 }
