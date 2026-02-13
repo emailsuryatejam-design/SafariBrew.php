@@ -396,25 +396,41 @@ PROMPT;
 
     $url = $endpoint . '?key=' . $apiKey;
 
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => $payload,
-        CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => 240,
-        CURLOPT_CONNECTTIMEOUT => 15,
-        CURLOPT_SSL_VERIFYPEER => true,
-    ]);
+    // Retry up to 3 times for rate-limit (429) errors
+    $maxRetries = 3;
+    $response = '';
+    $httpCode = 0;
 
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $curlError = curl_error($ch);
-    curl_close($ch);
+    for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 240,
+            CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_SSL_VERIFYPEER => true,
+        ]);
 
-    echo "Gemini response: HTTP {$httpCode}, " . strlen($response) . " bytes\n";
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        curl_close($ch);
 
-    if ($curlError) throw new Exception("Gemini API connection error: {$curlError}");
+        echo "Gemini response (attempt {$attempt}): HTTP {$httpCode}, " . strlen($response) . " bytes\n";
+
+        if ($curlError) throw new Exception("Gemini API connection error: {$curlError}");
+
+        if ($httpCode === 429 && $attempt < $maxRetries) {
+            $wait = $attempt * 15;
+            echo "Rate limited — waiting {$wait}s before retry...\n";
+            sleep($wait);
+            continue;
+        }
+
+        break;
+    }
 
     if ($httpCode !== 200) {
         $errBody = json_decode($response, true);
