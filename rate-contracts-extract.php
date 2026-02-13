@@ -1,18 +1,15 @@
 <?php
 /**
- * AI Brew - DeepSeek-powered contract data extraction.
+ * AI Brew - Gemini Vision-powered contract data extraction.
  * POST { contract_id }
  *
- * Uses the DeepSeek AI API to intelligently parse PDF text and return
- * structured JSON that maps directly to our database tables.
- *
  * Flow:
- * 1. Read the uploaded PDF file
- * 2. Extract raw text from PDF (pdftotext / PHP fallback)
- * 3. Send text to DeepSeek AI with a structured JSON schema prompt
- * 4. Parse DeepSeek's JSON response directly into DB tables
- * 5. Link rates to room_type_id / season_id
- * 6. Return the extracted data for user review
+ * 1. Validate request, set status to 'processing'
+ * 2. Send immediate HTTP response to client (non-blocking)
+ * 3. Continue in background: convert PDF pages → images via Ghostscript
+ * 4. Send page images to Gemini Vision (gemini-2.0-flash)
+ * 5. Parse Gemini's JSON → save directly into DB tables
+ * 6. Update extraction_status to 'completed' or 'failed'
  */
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/middleware.php';
@@ -43,6 +40,34 @@ if ($contract['extraction_mode'] !== 'ai_brew') {
 $pdo->prepare("UPDATE rate_contracts SET extraction_status = 'processing' WHERE id = ?")
     ->execute([$contractId]);
 
+// ===== Send immediate response & close connection =====
+$response = json_encode([
+    'message' => 'Extraction started. This will take 1-2 minutes.',
+    'extraction_status' => 'processing',
+]);
+
+// Tell browser the response is complete
+http_response_code(200);
+header('Content-Type: application/json; charset=utf-8');
+header('Content-Length: ' . strlen($response));
+header('Connection: close');
+
+echo $response;
+
+// Flush all output buffers
+if (ob_get_level() > 0) ob_end_flush();
+flush();
+
+// Close the session if open
+if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+
+// Allow script to run for up to 5 minutes in the background
+set_time_limit(300);
+ignore_user_abort(true);
+
+// ===== BACKGROUND EXTRACTION =====
+$userId = $auth['user_id'];
+
 try {
     // ----- Step 1: Locate the PDF file -----
     $fileUrl = $contract['original_file_url'];
@@ -62,26 +87,26 @@ try {
         throw new Exception('PDF file not found');
     }
 
-    // ----- Step 2: Extract text from PDF -----
-    $extractedText = extractTextFromPdf($filePath);
+    // ----- Step 2: Convert PDF pages to images via Ghostscript -----
+    $pageImages = convertPdfToImages($filePath);
 
     // Clean up temp file
     if ($tempFile) @unlink($filePath);
 
-    if (empty($extractedText) || strlen($extractedText) < 50) {
-        throw new Exception('Could not extract readable text from PDF. The file may be scanned/image-based.');
+    if (empty($pageImages)) {
+        throw new Exception('Could not convert PDF to images. Ghostscript may not be available.');
     }
 
-    // Truncate if extremely long (DeepSeek context window ~64k tokens)
-    if (strlen($extractedText) > 120000) {
-        $extractedText = substr($extractedText, 0, 120000) . "\n\n[TEXT TRUNCATED - document was very long]";
-    }
+    // ----- Step 3: Call Gemini Vision AI -----
+    $parsedData = callGeminiVisionExtraction($pageImages, $contract);
 
-    // ----- Step 3: Call DeepSeek AI -----
-    $parsedData = callDeepSeekExtraction($extractedText, $contract);
+    // Clean up temp images
+    foreach ($pageImages as $img) {
+        @unlink($img);
+    }
 
     if (empty($parsedData) || !is_array($parsedData)) {
-        throw new Exception('DeepSeek returned empty or invalid data');
+        throw new Exception('Gemini returned empty or invalid data');
     }
 
     // ----- Step 4: Save extraction raw data -----
@@ -127,7 +152,7 @@ try {
         $savedSections[] = 'seasons';
     }
 
-    // Rates - need to link room_type_id and season_id
+    // Rates - link room_type_id and season_id
     if (!empty($parsedData['rates'])) {
         $rates = linkRatesToIds($pdo, $contractId, $parsedData['rates']);
         saveSection($pdo, $contractId, 'contract_rates', $rates,
@@ -185,21 +210,15 @@ try {
 
     // Audit log
     $pdo->prepare("INSERT INTO contract_audit_log (contract_id, user_id, action, details) VALUES (?, ?, 'ai_extracted', ?)")
-        ->execute([$contractId, $auth['user_id'], json_encode([
-            'engine' => 'deepseek-chat',
+        ->execute([$contractId, $userId, json_encode([
+            'engine' => 'gemini-2.0-flash-vision',
             'sections' => $savedSections,
-            'text_length' => strlen($extractedText),
+            'pages_processed' => count($pageImages ?? []),
         ])]);
 
     // Update contract status
     $pdo->prepare("UPDATE rate_contracts SET status = 'extracted' WHERE id = ?")
         ->execute([$contractId]);
-
-    jsonResponse([
-        'message' => 'Contract data extracted successfully via DeepSeek AI',
-        'sections_extracted' => $savedSections,
-        'data' => $parsedData,
-    ]);
 
 } catch (Exception $e) {
     // Update status to failed
@@ -207,186 +226,254 @@ try {
         ->execute([$contractId]);
 
     $pdo->prepare("INSERT INTO contract_audit_log (contract_id, user_id, action, details) VALUES (?, ?, 'extraction_failed', ?)")
-        ->execute([$contractId, $auth['user_id'], json_encode(['error' => $e->getMessage()])]);
+        ->execute([$contractId, $userId, json_encode(['error' => $e->getMessage()])]);
 
-    jsonError('Extraction failed: ' . $e->getMessage(), 500);
+    // Clean up any temp images
+    if (!empty($pageImages)) {
+        foreach ($pageImages as $img) @unlink($img);
+    }
 }
+
+exit;
 
 // ========== Helper Functions ==========
 
 /**
- * Call DeepSeek AI to extract structured data from contract text
+ * Convert PDF pages to PNG images using Ghostscript
+ * Returns array of temp file paths
  */
-function callDeepSeekExtraction($text, $contract) {
-    $apiKey = defined('DEEPSEEK_API_KEY') ? DEEPSEEK_API_KEY : '';
-    if (empty($apiKey)) {
-        throw new Exception('DeepSeek API key not configured');
+function convertPdfToImages($pdfPath) {
+    $tmpDir = sys_get_temp_dir();
+    $prefix = 'rcpg_' . uniqid() . '_';
+    $outputPattern = "{$tmpDir}/{$prefix}%03d.png";
+    $escapedPdf = escapeshellarg($pdfPath);
+    $escapedOut = escapeshellarg($outputPattern);
+
+    // Convert at 200 DPI for good quality without huge file sizes
+    $cmd = "gs -sDEVICE=png16m -r200 -dNOPAUSE -dBATCH -dQUIET "
+         . "-dMaxBitmap=500000000 -dAlignToPixels=0 -dGridFitTT=2 "
+         . "-sOutputFile={$outputPattern} {$escapedPdf} 2>/dev/null";
+
+    exec($cmd, $output, $returnCode);
+
+    // Collect generated page images
+    $images = [];
+    for ($i = 1; $i <= 50; $i++) { // max 50 pages
+        $pageFile = sprintf("{$tmpDir}/{$prefix}%03d.png", $i);
+        if (file_exists($pageFile)) {
+            $images[] = $pageFile;
+        } else {
+            break;
+        }
     }
 
-    $systemPrompt = <<<'PROMPT'
-You are a hotel/lodge rate contract data extraction expert. You will receive raw text extracted from a PDF rate contract for a safari lodge, hotel, or camp. Your job is to extract ALL structured data and return it as a single JSON object.
+    return $images;
+}
 
-Return ONLY valid JSON with this exact structure (omit sections that have no data):
+/**
+ * Call Gemini Vision API with page images for structured extraction
+ */
+function callGeminiVisionExtraction($pageImages, $contract) {
+    $apiKey = defined('GEMINI_API_KEY') ? GEMINI_API_KEY : '';
+    if (empty($apiKey)) {
+        throw new Exception('Gemini API key not configured');
+    }
+
+    $endpoint = defined('GEMINI_ENDPOINT') ? GEMINI_ENDPOINT : '';
+    if (empty($endpoint)) {
+        throw new Exception('Gemini endpoint not configured');
+    }
+
+    // Build the parts array: images first, then the extraction prompt
+    $parts = [];
+
+    // Add page images (limit to 20 pages to stay within Gemini limits)
+    $maxPages = min(count($pageImages), 20);
+    for ($i = 0; $i < $maxPages; $i++) {
+        $imageData = file_get_contents($pageImages[$i]);
+        if ($imageData === false) continue;
+
+        $base64 = base64_encode($imageData);
+        $parts[] = [
+            'inline_data' => [
+                'mime_type' => 'image/png',
+                'data' => $base64,
+            ]
+        ];
+    }
+
+    // Add the extraction prompt
+    $propertyName = $contract['property_name'] ?? 'Unknown';
+    $currencyHint = $contract['currency'] ?? 'USD';
+
+    $prompt = <<<PROMPT
+You are a hotel/lodge rate contract data extraction expert. These are pages from a PDF rate contract for "{$propertyName}". Currency hint: {$currencyHint}.
+
+Extract ALL structured data from these pages and return a single JSON object.
+
+Return ONLY valid JSON (no markdown, no explanation) with this exact structure. Omit sections that have no data:
 
 {
   "header": {
-    "property_name": "string - hotel/lodge/camp name",
-    "currency": "string - 3-letter code e.g. USD, EUR, GBP, TZS",
-    "validity_start": "string - YYYY-MM-DD format",
-    "validity_end": "string - YYYY-MM-DD format",
-    "rate_basis": "string - one of: net, rack, commissionable",
-    "market": "string - target market if mentioned e.g. International, Domestic"
+    "property_name": "hotel/lodge/camp name",
+    "currency": "3-letter code e.g. USD",
+    "validity_start": "YYYY-MM-DD",
+    "validity_end": "YYYY-MM-DD",
+    "rate_basis": "net or rack or commissionable",
+    "market": "International or Domestic or EAC etc"
   },
   "room_types": [
     {
-      "room_name": "string - exact room/tent/suite name",
-      "room_category": "string - one of: standard, deluxe, suite, villa, tented, cottage, bungalow, chalet, family",
-      "max_occupancy": "integer or null",
-      "bed_config": "string or null - e.g. King, Twin, Double",
-      "description": "string or null",
-      "sort_order": "integer starting from 0"
+      "room_name": "exact room/tent/suite name from the document",
+      "room_category": "standard|deluxe|suite|villa|tented|cottage|bungalow|chalet|family",
+      "max_occupancy": null,
+      "bed_config": null,
+      "description": null,
+      "sort_order": 0
     }
   ],
   "seasons": [
     {
-      "season_name": "string - e.g. Peak Season, High Season",
-      "season_type": "string - one of: peak, high, mid, low, green, festive, special",
-      "start_date": "string - YYYY-MM-DD",
-      "end_date": "string - YYYY-MM-DD",
-      "notes": "string or null",
-      "sort_order": "integer starting from 0"
+      "season_name": "e.g. Peak Season, High Season, Low Season",
+      "season_type": "peak|high|mid|low|green|festive|special",
+      "start_date": "YYYY-MM-DD",
+      "end_date": "YYYY-MM-DD",
+      "notes": null,
+      "sort_order": 0
     }
   ],
   "rates": [
     {
-      "room_name": "string - must match a room_types entry exactly",
-      "season_name": "string - must match a seasons entry exactly",
-      "meal_plan": "string - one of: RO, BB, HB, FB, AI (Room Only, Bed&Breakfast, Half Board, Full Board, All Inclusive)",
-      "rate_pps": "number or null - rate per person sharing",
-      "rate_single": "number or null - single occupancy rate",
-      "rate_double": "number or null - double/twin room rate",
-      "rate_triple": "number or null - triple occupancy rate",
-      "rate_child": "number or null - child rate",
-      "rate_infant": "number or null - infant rate",
-      "rate_single_supplement": "number or null",
-      "rate_extra_bed": "number or null",
-      "rate_extra_adult": "number or null",
-      "currency": "string - 3-letter code",
-      "min_nights": "integer or null",
-      "notes": "string or null"
+      "room_name": "MUST exactly match a room_types entry",
+      "season_name": "MUST exactly match a seasons entry",
+      "meal_plan": "RO|BB|HB|FB|AI",
+      "rate_pps": null,
+      "rate_single": null,
+      "rate_double": null,
+      "rate_triple": null,
+      "rate_child": null,
+      "rate_infant": null,
+      "rate_single_supplement": null,
+      "rate_extra_bed": null,
+      "rate_extra_adult": null,
+      "currency": "USD",
+      "min_nights": null,
+      "notes": null
     }
   ],
   "child_policies": [
     {
-      "age_from": "integer",
-      "age_to": "integer",
-      "policy_type": "string - one of: free, percentage, fixed",
-      "sharing_with_1_adult": "number or null - percentage or fixed amount",
-      "sharing_with_2_adults": "number or null - percentage or fixed amount",
-      "own_room": "number or null",
-      "fixed_rate": "number or null",
-      "max_children_per_room": "integer or null",
-      "currency": "string or null",
-      "notes": "string or null"
+      "age_from": 0,
+      "age_to": 5,
+      "policy_type": "free|percentage|fixed",
+      "sharing_with_1_adult": null,
+      "sharing_with_2_adults": null,
+      "own_room": null,
+      "fixed_rate": null,
+      "max_children_per_room": null,
+      "currency": null,
+      "notes": null
     }
   ],
   "special_supplements": [
     {
-      "supplement_name": "string - e.g. Christmas Supplement, Easter Surcharge",
-      "supplement_type": "string - one of: fixed_per_night, fixed_per_stay, percentage",
-      "amount": "number or null",
-      "percentage": "number or null",
-      "start_date": "string or null - YYYY-MM-DD",
-      "end_date": "string or null - YYYY-MM-DD",
-      "applies_to": "string or null - e.g. all_guests, adults_only",
-      "currency": "string or null",
-      "notes": "string or null"
+      "supplement_name": "e.g. Christmas Supplement",
+      "supplement_type": "fixed_per_night|fixed_per_stay|percentage",
+      "amount": null,
+      "percentage": null,
+      "start_date": null,
+      "end_date": null,
+      "applies_to": null,
+      "currency": null,
+      "notes": null
     }
   ],
   "cancellation_policies": [
     {
-      "days_before_from": "integer - e.g. 60",
-      "days_before_to": "integer - e.g. 90",
-      "charge_type": "string - one of: percentage, fixed, full_charge, no_charge",
-      "charge_value": "number - percentage (0-100) or fixed amount",
-      "currency": "string or null",
-      "notes": "string or null",
-      "sort_order": "integer starting from 0"
+      "days_before_from": 60,
+      "days_before_to": 90,
+      "charge_type": "percentage|fixed|full_charge|no_charge",
+      "charge_value": 0,
+      "currency": null,
+      "notes": null,
+      "sort_order": 0
     }
   ],
   "activities": [
     {
       "activity_name": "string",
-      "category": "string or null - e.g. Game Drive, Walking Safari, Boat Trip",
-      "rate_adult": "number or null",
-      "rate_child": "number or null",
-      "rate_per_vehicle": "number or null",
-      "min_pax": "integer or null",
-      "duration": "string or null",
-      "included_in_package": "boolean - true if included in room rate",
-      "currency": "string or null",
-      "notes": "string or null"
+      "category": null,
+      "rate_adult": null,
+      "rate_child": null,
+      "rate_per_vehicle": null,
+      "min_pax": null,
+      "duration": null,
+      "included_in_package": false,
+      "currency": null,
+      "notes": null
     }
   ],
   "park_fees": [
     {
-      "fee_name": "string - e.g. Park Entry Fee, Concession Fee, Conservation Fee",
-      "fee_type": "string - one of: park_entry, concession, conservation, community, other",
-      "rate_adult": "number or null",
-      "rate_child": "number or null",
-      "child_age_limit": "integer or null",
-      "per_unit": "string - one of: per_person_per_day, per_person_per_stay, per_vehicle",
-      "high_season_rate_adult": "number or null",
-      "high_season_rate_child": "number or null",
-      "included_in_rate": "boolean - true if included in room rate",
-      "currency": "string or null",
-      "notes": "string or null"
+      "fee_name": "e.g. Park Entry Fee",
+      "fee_type": "park_entry|concession|conservation|community|other",
+      "rate_adult": null,
+      "rate_child": null,
+      "child_age_limit": null,
+      "per_unit": "per_person_per_day|per_person_per_stay|per_vehicle",
+      "high_season_rate_adult": null,
+      "high_season_rate_child": null,
+      "included_in_rate": false,
+      "currency": null,
+      "notes": null
     }
   ],
   "policies": [
     {
-      "policy_type": "string - e.g. check_in_time, check_out_time, minimum_stay, payment_terms, deposit, children_policy",
-      "policy_value": "string - the actual value",
-      "notes": "string or null"
+      "policy_type": "check_in_time|check_out_time|minimum_stay|payment_terms|deposit|children_policy",
+      "policy_value": "the actual value",
+      "notes": null
     }
   ]
 }
 
-IMPORTANT RULES:
-- Extract EVERY rate, room, season, and policy you can find. Be thorough.
-- All dates must be in YYYY-MM-DD format. If only month/day given, assume the contract's validity year.
-- All monetary values must be numbers without currency symbols.
-- room_name in rates must EXACTLY match a room_name in room_types.
-- season_name in rates must EXACTLY match a season_name in seasons.
-- If rates are "per person sharing" (pps/ppps/pppn), put the value in rate_pps.
-- If the contract shows rates in a table format, extract EVERY cell/combination.
-- Return ONLY the JSON object, no markdown, no explanation.
+CRITICAL RULES:
+- Extract EVERY rate, room type, season, and policy visible in these pages. Be thorough.
+- Read ALL tables carefully — every row/column combination is a rate entry.
+- All dates MUST be YYYY-MM-DD format. If only month given, use day 01/end-of-month.
+- All monetary values MUST be numbers without currency symbols or commas.
+- room_name in rates MUST EXACTLY match a room_name in room_types.
+- season_name in rates MUST EXACTLY match a season_name in seasons.
+- If rates are "per person sharing" (pps/ppps/pppn), use rate_pps field.
+- If rates are per room, use rate_single / rate_double fields.
+- Create one rate entry for EACH room + season combination.
+- Return ONLY the JSON object, no markdown code blocks, no explanation.
 PROMPT;
 
-    $userMessage = "Extract all rate contract data from this PDF text. The contract is for property: \"{$contract['property_name']}\", currency hint: \"{$contract['currency']}\".\n\n--- PDF TEXT START ---\n{$text}\n--- PDF TEXT END ---";
+    $parts[] = ['text' => $prompt];
 
-    $payload = [
-        'model' => 'deepseek-chat',
-        'messages' => [
-            ['role' => 'system', 'content' => $systemPrompt],
-            ['role' => 'user', 'content' => $userMessage],
+    $payload = json_encode([
+        'contents' => [
+            ['parts' => $parts]
         ],
-        'response_format' => ['type' => 'json_object'],
-        'max_tokens' => 8192,
-        'temperature' => 0.1,
-    ];
+        'generationConfig' => [
+            'temperature' => 0.1,
+            'maxOutputTokens' => 16384,
+            'responseMimeType' => 'application/json',
+        ],
+    ]);
 
-    $ch = curl_init('https://api.deepseek.com/chat/completions');
+    $url = $endpoint . '?key=' . $apiKey;
+
+    $ch = curl_init($url);
     curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
         CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => json_encode($payload),
-        CURLOPT_HTTPHEADER => [
-            'Content-Type: application/json',
-            'Authorization: Bearer ' . $apiKey,
-        ],
-        CURLOPT_TIMEOUT => 180, // 3 minutes for large contracts
+        CURLOPT_POSTFIELDS => $payload,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 240, // 4 minutes for large PDFs with images
         CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_SSL_VERIFYPEER => true,
     ]);
 
     $response = curl_exec($ch);
@@ -395,21 +482,22 @@ PROMPT;
     curl_close($ch);
 
     if ($curlError) {
-        throw new Exception("DeepSeek API connection error: {$curlError}");
+        throw new Exception("Gemini API connection error: {$curlError}");
     }
 
     if ($httpCode !== 200) {
         $errBody = json_decode($response, true);
-        $errMsg = $errBody['error']['message'] ?? $errBody['error'] ?? "HTTP {$httpCode}";
-        throw new Exception("DeepSeek API error: {$errMsg}");
+        $errMsg = $errBody['error']['message'] ?? "HTTP {$httpCode}";
+        throw new Exception("Gemini API error: {$errMsg}");
     }
 
     $result = json_decode($response, true);
-    if (empty($result['choices'][0]['message']['content'])) {
-        throw new Exception('DeepSeek returned an empty response');
+    $content = $result['candidates'][0]['content']['parts'][0]['text'] ?? '';
+
+    if (empty($content)) {
+        throw new Exception('Gemini returned an empty response');
     }
 
-    $content = $result['choices'][0]['message']['content'];
     $parsed = json_decode($content, true);
 
     if (json_last_error() !== JSON_ERROR_NONE) {
@@ -417,8 +505,14 @@ PROMPT;
         if (preg_match('/```(?:json)?\s*([\s\S]+?)\s*```/', $content, $m)) {
             $parsed = json_decode($m[1], true);
         }
+        // Try to find JSON object in the response
         if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new Exception('DeepSeek returned invalid JSON: ' . json_last_error_msg());
+            if (preg_match('/\{[\s\S]+\}/', $content, $m)) {
+                $parsed = json_decode($m[0], true);
+            }
+        }
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new Exception('Gemini returned invalid JSON: ' . json_last_error_msg() . ' — Raw: ' . substr($content, 0, 500));
         }
     }
 
@@ -429,7 +523,6 @@ PROMPT;
  * Link rates to room_type_id and season_id by matching names
  */
 function linkRatesToIds($pdo, $contractId, $rates) {
-    // Get saved room types
     $stmt = $pdo->prepare("SELECT id, room_name FROM contract_room_types WHERE contract_id = ?");
     $stmt->execute([$contractId]);
     $roomMap = [];
@@ -437,7 +530,6 @@ function linkRatesToIds($pdo, $contractId, $rates) {
         $roomMap[strtolower(trim($row['room_name']))] = $row['id'];
     }
 
-    // Get saved seasons
     $stmt = $pdo->prepare("SELECT id, season_name FROM contract_seasons WHERE contract_id = ?");
     $stmt->execute([$contractId]);
     $seasonMap = [];
@@ -450,14 +542,11 @@ function linkRatesToIds($pdo, $contractId, $rates) {
         $roomName = strtolower(trim($rate['room_name'] ?? ''));
         $seasonName = strtolower(trim($rate['season_name'] ?? ''));
 
-        // Find best match (exact or partial)
         $roomId = $roomMap[$roomName] ?? findClosestMatch($roomName, $roomMap);
         $seasonId = $seasonMap[$seasonName] ?? findClosestMatch($seasonName, $seasonMap);
 
         $rate['room_type_id'] = $roomId;
         $rate['season_id'] = $seasonId;
-
-        // Remove string fields that aren't in the DB
         unset($rate['room_name'], $rate['season_name']);
 
         $linked[] = $rate;
@@ -478,7 +567,6 @@ function findClosestMatch($needle, $map) {
         }
     }
 
-    // Try word-by-word matching
     $needleWords = explode(' ', $needle);
     foreach ($map as $key => $id) {
         $matchCount = 0;
@@ -496,152 +584,9 @@ function findClosestMatch($needle, $map) {
 }
 
 /**
- * Extract text from PDF using available methods
- */
-function extractTextFromPdf($filePath) {
-    // Method 1: Smalot PDF Parser (pure PHP, works on Hostinger)
-    $result = trySmalotPdfParser($filePath);
-    if ($result) return $result;
-
-    // Method 2: pdftotext (poppler-utils) - best for text-based PDFs
-    $result = tryPdftotext($filePath);
-    if ($result) return $result;
-
-    // Method 3: Python pdfplumber (if available) - good for tables
-    $result = tryPythonPdfExtract($filePath);
-    if ($result) return $result;
-
-    // Method 4: Basic PHP PDF parsing (last resort)
-    $result = tryPhpPdfParse($filePath);
-    if ($result) return $result;
-
-    return '';
-}
-
-/**
- * Try Smalot PDF Parser (composer package)
- */
-function trySmalotPdfParser($filePath) {
-    $autoloadPath = __DIR__ . '/vendor/autoload.php';
-    if (!file_exists($autoloadPath)) return null;
-
-    require_once $autoloadPath;
-
-    if (!class_exists('\\Smalot\\PdfParser\\Parser')) return null;
-
-    try {
-        $parser = new \Smalot\PdfParser\Parser();
-        $pdf = $parser->parseFile($filePath);
-        $text = $pdf->getText();
-
-        // Also try per-page for better structure
-        $pages = $pdf->getPages();
-        if (count($pages) > 1) {
-            $pageTexts = [];
-            foreach ($pages as $i => $page) {
-                $pageText = $page->getText();
-                if (!empty(trim($pageText))) {
-                    $pageTexts[] = "--- Page " . ($i + 1) . " ---\n" . $pageText;
-                }
-            }
-            if (!empty($pageTexts)) {
-                $text = implode("\n\n", $pageTexts);
-            }
-        }
-
-        return (!empty($text) && strlen($text) > 50) ? $text : null;
-    } catch (Exception $e) {
-        return null;
-    }
-}
-
-/**
- * Try pdftotext (poppler-utils)
- */
-function tryPdftotext($filePath) {
-    $escapedPath = escapeshellarg($filePath);
-    $output = shell_exec("pdftotext -layout {$escapedPath} - 2>/dev/null");
-    return (!empty($output) && strlen($output) > 50) ? $output : null;
-}
-
-/**
- * Try Python pdfplumber for better table extraction
- */
-function tryPythonPdfExtract($filePath) {
-    $escapedPath = escapeshellarg($filePath);
-
-    $pyScript = <<<'PYTHON'
-import sys, json
-try:
-    import pdfplumber
-    with pdfplumber.open(sys.argv[1]) as pdf:
-        text = ""
-        for i, page in enumerate(pdf.pages):
-            text += page.extract_text() or ""
-            text += "\n"
-            tables = page.extract_tables()
-            for table in tables:
-                text += "\n[TABLE]\n"
-                for row in table:
-                    text += "\t".join([str(cell or "") for cell in row]) + "\n"
-                text += "[/TABLE]\n"
-            text += "\n---\n"
-    print(json.dumps({"text": text}))
-except ImportError:
-    try:
-        import PyPDF2
-        reader = PyPDF2.PdfReader(sys.argv[1])
-        text = ""
-        for page in reader.pages:
-            text += (page.extract_text() or "") + "\n---\n"
-        print(json.dumps({"text": text}))
-    except:
-        print(json.dumps({"error": "no pdf library"}))
-PYTHON;
-
-    $tmpScript = tempnam(sys_get_temp_dir(), 'pdf_') . '.py';
-    file_put_contents($tmpScript, $pyScript);
-    $escapedScript = escapeshellarg($tmpScript);
-
-    $output = shell_exec("python3 {$escapedScript} {$escapedPath} 2>/dev/null");
-    @unlink($tmpScript);
-
-    if ($output) {
-        $decoded = json_decode($output, true);
-        if ($decoded && !empty($decoded['text']) && strlen($decoded['text']) > 50) {
-            return $decoded['text'];
-        }
-    }
-
-    return null;
-}
-
-/**
- * Basic PHP PDF text extraction (last resort)
- */
-function tryPhpPdfParse($filePath) {
-    $content = file_get_contents($filePath);
-    if (!$content) return null;
-
-    $text = '';
-    preg_match_all('/BT\s*(.*?)\s*ET/s', $content, $matches);
-    if (!empty($matches[1])) {
-        foreach ($matches[1] as $block) {
-            preg_match_all('/\(([^)]*)\)/', $block, $strings);
-            if (!empty($strings[1])) {
-                $text .= implode(' ', $strings[1]) . "\n";
-            }
-        }
-    }
-
-    return strlen($text) > 50 ? $text : null;
-}
-
-/**
  * Save a section of data to the database
  */
 function saveSection($pdo, $contractId, $table, $items, $fields) {
-    // Clear existing
     $pdo->prepare("DELETE FROM {$table} WHERE contract_id = ?")->execute([$contractId]);
 
     $sortIdx = 0;
@@ -650,7 +595,6 @@ function saveSection($pdo, $contractId, $table, $items, $fields) {
         $placeholders = ['?'];
         $values = [$contractId];
 
-        // Auto-add sort_order if field is expected but not provided
         if (in_array('sort_order', $fields) && !isset($item['sort_order'])) {
             $item['sort_order'] = $sortIdx++;
         }
@@ -666,7 +610,7 @@ function saveSection($pdo, $contractId, $table, $items, $fields) {
             }
         }
 
-        if (count($cols) > 1) { // Only insert if we have data beyond contract_id
+        if (count($cols) > 1) {
             $sql = "INSERT INTO {$table} (" . implode(', ', $cols) . ") VALUES (" . implode(', ', $placeholders) . ")";
             $pdo->prepare($sql)->execute($values);
         }

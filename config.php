@@ -10,8 +10,10 @@ define('JWT_SECRET', 'safaribrew-jwt-secret-change-in-production-2026');
 define('JWT_EXPIRY', 8 * 3600); // 8 hours
 define('BASE_URL', 'http://localhost:8000');
 
-// DeepSeek AI (for AI Brew extraction)
-define('DEEPSEEK_API_KEY', 'sk-e25579a5c6854fd7a4d78cb5bdb08a77');
+// AI APIs (for AI Brew extraction)
+define('GEMINI_API_KEY', 'AIzaSyDso0Ae7zMkPuswSzrmPYfr9Q1KhQlls8c');
+define('GEMINI_MODEL', 'gemini-2.0-flash');
+define('GEMINI_ENDPOINT', 'https://generativelanguage.googleapis.com/v1beta/models/' . GEMINI_MODEL . ':generateContent');
 
 // CORS
 header('Access-Control-Allow-Origin: *');
