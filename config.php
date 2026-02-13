@@ -8,14 +8,14 @@ define('DB_PASS', '6145ury@Teja');
 // App
 define('JWT_SECRET', 'safaribrew-jwt-secret-change-in-production-2026');
 define('JWT_EXPIRY', 8 * 3600); // 8 hours
-define('BASE_URL', 'http://localhost:8000');
 
-// Load secrets from .env.php (gitignored)
+// Load secrets and environment overrides from .env.php (gitignored)
 if (file_exists(__DIR__ . '/.env.php')) {
     require_once __DIR__ . '/.env.php';
 }
 
-// AI APIs (for AI Brew extraction)
+// Defaults (overridden by .env.php in production)
+if (!defined('BASE_URL')) define('BASE_URL', 'http://localhost:8000');
 if (!defined('GEMINI_API_KEY')) define('GEMINI_API_KEY', '');
 define('GEMINI_MODEL', 'gemini-2.0-flash');
 define('GEMINI_ENDPOINT', 'https://generativelanguage.googleapis.com/v1beta/models/' . GEMINI_MODEL . ':generateContent');
