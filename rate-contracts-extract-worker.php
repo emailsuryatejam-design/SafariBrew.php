@@ -107,28 +107,44 @@ try {
     // ===== PASS 2: Rates — extracted PER SEASON to avoid token limits =====
     $roomNames = array_column($parsedData['room_types'] ?? [], 'room_name');
     $seasonNames = array_column($parsedData['seasons'] ?? [], 'season_name');
-    $parsedData['rates'] = [];
 
-    if (!empty($seasonNames)) {
-        $totalPasses = count($seasonNames) + 2; // +1 for pass1, +1 for pass3
-        foreach ($seasonNames as $si => $season) {
+    // Deduplicate season names (same name may appear for different years)
+    $uniqueSeasons = array_values(array_unique($seasonNames));
+    $parsedData['rates'] = [];
+    $failedSeasons = [];
+
+    if (!empty($uniqueSeasons)) {
+        $totalPasses = count($uniqueSeasons) + 2; // +1 for pass1, +1 for pass3
+        foreach ($uniqueSeasons as $si => $season) {
             $passNum = $si + 2;
             echo "\n=== PASS {$passNum}/{$totalPasses}: Rates for \"{$season}\" ===\n";
-            $pass2 = callGeminiPass($imageParts, buildPass2Prompt($propertyName, $currencyHint, $roomNames, [$season]));
-            if (!empty($pass2) && !empty($pass2['rates'])) {
-                $parsedData['rates'] = array_merge($parsedData['rates'], $pass2['rates']);
-                echo "Got " . count($pass2['rates']) . " rate entries for \"{$season}\"\n";
+            try {
+                $pass2 = callGeminiPass($imageParts, buildPass2Prompt($propertyName, $currencyHint, $roomNames, [$season]));
+                if (!empty($pass2) && !empty($pass2['rates'])) {
+                    $parsedData['rates'] = array_merge($parsedData['rates'], $pass2['rates']);
+                    echo "Got " . count($pass2['rates']) . " rate entries for \"{$season}\"\n";
+                }
+            } catch (Exception $e) {
+                echo "WARN: Rates pass for \"{$season}\" failed: " . $e->getMessage() . " — skipping\n";
+                $failedSeasons[] = $season;
             }
             // Pause between season passes to avoid rate limiting
-            if ($si < count($seasonNames) - 1) sleep(3);
+            if ($si < count($uniqueSeasons) - 1) sleep(3);
         }
         echo "Total rates collected: " . count($parsedData['rates']) . "\n";
+        if (!empty($failedSeasons)) {
+            echo "Skipped seasons (token limit): " . implode(', ', $failedSeasons) . "\n";
+        }
     } else {
         // Fallback: single pass if no seasons extracted
         echo "\n=== PASS 2: Rates (no seasons found, single pass) ===\n";
-        $pass2 = callGeminiPass($imageParts, buildPass2Prompt($propertyName, $currencyHint, $roomNames, []));
-        if (!empty($pass2) && !empty($pass2['rates'])) {
-            $parsedData['rates'] = $pass2['rates'];
+        try {
+            $pass2 = callGeminiPass($imageParts, buildPass2Prompt($propertyName, $currencyHint, $roomNames, []));
+            if (!empty($pass2) && !empty($pass2['rates'])) {
+                $parsedData['rates'] = $pass2['rates'];
+            }
+        } catch (Exception $e) {
+            echo "WARN: Single rates pass failed: " . $e->getMessage() . "\n";
         }
     }
 
@@ -136,16 +152,20 @@ try {
     sleep(3);
 
     // ===== FINAL PASS: Policies, Supplements, Activities, Park Fees =====
-    $finalPassNum = (!empty($seasonNames) ? count($seasonNames) + 2 : 3);
+    $finalPassNum = (!empty($uniqueSeasons) ? count($uniqueSeasons) + 2 : 3);
     echo "\n=== PASS {$finalPassNum}/{$finalPassNum}: Policies, Supplements, Activities ===\n";
-    $pass3 = callGeminiPass($imageParts, buildPass3Prompt($propertyName, $currencyHint));
-    if (!empty($pass3)) {
-        $pass3Sections = ['child_policies', 'special_supplements', 'cancellation_policies',
-                          'activities', 'park_fees', 'policies'];
-        foreach ($pass3Sections as $sec) {
-            if (!empty($pass3[$sec])) $parsedData[$sec] = $pass3[$sec];
+    try {
+        $pass3 = callGeminiPass($imageParts, buildPass3Prompt($propertyName, $currencyHint));
+        if (!empty($pass3)) {
+            $pass3Sections = ['child_policies', 'special_supplements', 'cancellation_policies',
+                              'activities', 'park_fees', 'policies'];
+            foreach ($pass3Sections as $sec) {
+                if (!empty($pass3[$sec])) $parsedData[$sec] = $pass3[$sec];
+            }
+            echo "Policies pass done\n";
         }
-        echo "Pass 3 done: " . implode(', ', array_intersect_key(array_flip($pass3Sections), $pass3)) . "\n";
+    } catch (Exception $e) {
+        echo "WARN: Policies pass failed: " . $e->getMessage() . " — skipping\n";
     }
 
     // Clean up temp images
@@ -260,7 +280,8 @@ try {
             'engine' => 'gemini-2.5-flash-vision-chunked',
             'sections' => $savedSections,
             'pages_processed' => count($pageImages),
-            'passes' => 2 + count($seasonNames ?? []),
+            'passes' => 2 + count($uniqueSeasons ?? []),
+            'failed_seasons' => $failedSeasons ?? [],
         ])]);
 
     // Update contract status
