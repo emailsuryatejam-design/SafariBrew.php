@@ -65,7 +65,7 @@ if ($method === 'PUT') {
         // Update quote fields
         $fields = [];
         $params = [];
-        $allowed = ['currency', 'valid_until', 'payment_terms', 'terms_conditions', 'notes',
+        $allowed = ['currency', 'rate_type', 'valid_until', 'payment_terms', 'terms_conditions', 'notes',
                      'subtotal', 'tax_amount', 'total'];
 
         foreach ($allowed as $f) {
@@ -85,10 +85,11 @@ if ($method === 'PUT') {
             $pdo->prepare("DELETE FROM quote_lines WHERE quote_id = ?")->execute([$id]);
 
             $stmt = $pdo->prepare("
-                INSERT INTO quote_lines (quote_id, day_number, service_type, title, description,
+                INSERT INTO quote_lines (quote_id, day_number, service_type, rate_type,
+                                         accommodation_id, contract_id, title, description,
                                          traveler_type, qty, nights, unit_price, markup_type, markup_value,
                                          sell_price, line_total, sort_order)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ");
 
             foreach ($data['lines'] as $i => $line) {
@@ -96,6 +97,9 @@ if ($method === 'PUT') {
                     $id,
                     $line['day_number'] ?? null,
                     $line['service_type'] ?? null,
+                    $line['rate_type'] ?? null,
+                    $line['accommodation_id'] ?? null,
+                    $line['contract_id'] ?? null,
                     $line['title'] ?? '',
                     $line['description'] ?? null,
                     $line['traveler_type'] ?? 'adult',

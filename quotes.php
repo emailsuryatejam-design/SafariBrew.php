@@ -79,10 +79,12 @@ if ($method === 'POST') {
 
         $quoteCode = generateCode('QTE', $pdo, 'quotes', 'quote_code');
 
+        $rateType = $data['rate_type'] ?? null;
+
         $stmt = $pdo->prepare("
             INSERT INTO quotes (branch_id, request_id, template_id, quote_code, status, currency,
-                                valid_until, payment_terms, terms_conditions, notes, created_by)
-            VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)
+                                rate_type, valid_until, payment_terms, terms_conditions, notes, created_by)
+            VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?)
         ");
         $stmt->execute([
             $bid,
@@ -90,6 +92,7 @@ if ($method === 'POST') {
             $data['template_id'] ?? null,
             $quoteCode,
             $data['currency'] ?? 'USD',
+            $rateType,
             $data['valid_until'] ?? null,
             $data['payment_terms'] ?? null,
             $data['terms_conditions'] ?? null,
@@ -125,8 +128,10 @@ if ($method === 'POST') {
                 foreach ($services as $svc) {
                     $title = $svc['title'] ?? '';
                     $unitPrice = 0;
+                    $lineContractId = null;
+                    $lineAccommodationId = $svc['accommodation_id'] ?? null;
 
-                    // Try to get default rate from linked accommodation or activity
+                    // Try to get rate from active contract if rate_type specified
                     if ($svc['service_type'] === 'accommodation' && $svc['accommodation_id']) {
                         $stmt2 = $pdo->prepare("SELECT name, default_rate_adult FROM content_accommodations WHERE id = ?");
                         $stmt2->execute([$svc['accommodation_id']]);
@@ -134,6 +139,26 @@ if ($method === 'POST') {
                         if ($acc) {
                             if (!$title) $title = $acc['name'];
                             $unitPrice = (float)($acc['default_rate_adult'] ?? 0);
+                        }
+
+                        // If rate_type set, try to find a matching active contract rate
+                        if ($rateType && $svc['accommodation_id']) {
+                            $stmt2 = $pdo->prepare("
+                                SELECT rc.id AS contract_id, cr.rate_pps, cr.rate_single, cr.rate_double, cr.currency
+                                FROM rate_contracts rc
+                                JOIN contract_rates cr ON cr.contract_id = rc.id
+                                WHERE rc.branch_id = ? AND rc.accommodation_id = ? AND rc.contract_type = ? AND rc.status = 'active'
+                                ORDER BY rc.validity_start DESC
+                                LIMIT 1
+                            ");
+                            $stmt2->execute([$bid, (int)$svc['accommodation_id'], $rateType]);
+                            $contractRate = $stmt2->fetch();
+                            if ($contractRate) {
+                                $lineContractId = (int)$contractRate['contract_id'];
+                                // Use PPS (per person sharing) as the default unit price
+                                $cRate = (float)($contractRate['rate_pps'] ?? 0);
+                                if ($cRate > 0) $unitPrice = $cRate;
+                            }
                         }
                     } elseif ($svc['service_type'] === 'activity' && $svc['activity_id']) {
                         $stmt2 = $pdo->prepare("SELECT name, default_rate FROM content_activities WHERE id = ?");
@@ -152,14 +177,18 @@ if ($method === 'POST') {
                     $lineTotal = $unitPrice * $qty;
 
                     $stmt = $pdo->prepare("
-                        INSERT INTO quote_lines (quote_id, day_number, service_type, title, description,
+                        INSERT INTO quote_lines (quote_id, day_number, service_type, rate_type,
+                                                 accommodation_id, contract_id, title, description,
                                                  qty, nights, unit_price, sell_price, line_total, sort_order)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ");
                     $stmt->execute([
                         $quoteId,
                         $day['day_number'],
                         $svc['service_type'],
+                        $rateType,
+                        $lineAccommodationId,
+                        $lineContractId,
                         $title,
                         $svc['description'] ?? null,
                         $qty,
