@@ -1,18 +1,20 @@
 <?php
 /**
- * AI Brew - LangExtract-powered contract data extraction.
+ * AI Brew - DeepSeek-powered contract data extraction.
  * POST { contract_id }
  *
- * Uses the LangExtract open-source engine to parse the PDF
- * and extract structured rate data. This is the "AI Brew" premium feature.
+ * Uses the DeepSeek AI API to intelligently parse PDF text and return
+ * structured JSON that maps directly to our database tables.
  *
  * Flow:
  * 1. Read the uploaded PDF file
- * 2. Use LangExtract to parse and extract text
- * 3. Map extracted data to our contract data structure
- * 4. Save all extracted sections to the database
- * 5. Return the extracted data for user review
+ * 2. Extract raw text from PDF (pdftotext / PHP fallback)
+ * 3. Send text to DeepSeek AI with a structured JSON schema prompt
+ * 4. Parse DeepSeek's JSON response directly into DB tables
+ * 5. Link rates to room_type_id / season_id
+ * 6. Return the extracted data for user review
  */
+require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/middleware.php';
 
 $method = $_SERVER['REQUEST_METHOD'];
@@ -45,30 +47,42 @@ try {
     // ----- Step 1: Locate the PDF file -----
     $fileUrl = $contract['original_file_url'];
     $filePath = null;
+    $tempFile = false;
 
-    // If stored locally, resolve path
     if (strpos($fileUrl, BASE_URL) !== false) {
         $relativePath = str_replace(BASE_URL . '/', '', $fileUrl);
         $filePath = __DIR__ . '/' . $relativePath;
     } else {
-        // Download remote file to temp
         $filePath = tempnam(sys_get_temp_dir(), 'rct_');
         file_put_contents($filePath, file_get_contents($fileUrl));
+        $tempFile = true;
     }
 
     if (!$filePath || !file_exists($filePath)) {
         throw new Exception('PDF file not found');
     }
 
-    // ----- Step 2: Extract text using LangExtract -----
+    // ----- Step 2: Extract text from PDF -----
     $extractedText = extractTextFromPdf($filePath);
 
-    if (empty($extractedText)) {
-        throw new Exception('Could not extract text from PDF');
+    // Clean up temp file
+    if ($tempFile) @unlink($filePath);
+
+    if (empty($extractedText) || strlen($extractedText) < 50) {
+        throw new Exception('Could not extract readable text from PDF. The file may be scanned/image-based.');
     }
 
-    // ----- Step 3: Parse extracted text into structured data -----
-    $parsedData = parseContractText($extractedText, $contract);
+    // Truncate if extremely long (DeepSeek context window ~64k tokens)
+    if (strlen($extractedText) > 120000) {
+        $extractedText = substr($extractedText, 0, 120000) . "\n\n[TEXT TRUNCATED - document was very long]";
+    }
+
+    // ----- Step 3: Call DeepSeek AI -----
+    $parsedData = callDeepSeekExtraction($extractedText, $contract);
+
+    if (empty($parsedData) || !is_array($parsedData)) {
+        throw new Exception('DeepSeek returned empty or invalid data');
+    }
 
     // ----- Step 4: Save extraction raw data -----
     $pdo->prepare("UPDATE rate_contracts SET extraction_raw = ?, extraction_status = 'completed' WHERE id = ?")
@@ -113,9 +127,10 @@ try {
         $savedSections[] = 'seasons';
     }
 
-    // Rates
+    // Rates - need to link room_type_id and season_id
     if (!empty($parsedData['rates'])) {
-        saveSection($pdo, $contractId, 'contract_rates', $parsedData['rates'],
+        $rates = linkRatesToIds($pdo, $contractId, $parsedData['rates']);
+        saveSection($pdo, $contractId, 'contract_rates', $rates,
             ['room_type_id', 'season_id', 'meal_plan', 'rate_basis', 'rate_pps', 'rate_single',
              'rate_double', 'rate_triple', 'rate_child', 'rate_infant', 'rate_single_supplement',
              'rate_extra_bed', 'rate_extra_adult', 'currency', 'min_nights', 'notes']);
@@ -171,6 +186,7 @@ try {
     // Audit log
     $pdo->prepare("INSERT INTO contract_audit_log (contract_id, user_id, action, details) VALUES (?, ?, 'ai_extracted', ?)")
         ->execute([$contractId, $auth['user_id'], json_encode([
+            'engine' => 'deepseek-chat',
             'sections' => $savedSections,
             'text_length' => strlen($extractedText),
         ])]);
@@ -180,7 +196,7 @@ try {
         ->execute([$contractId]);
 
     jsonResponse([
-        'message' => 'Contract data extracted successfully',
+        'message' => 'Contract data extracted successfully via DeepSeek AI',
         'sections_extracted' => $savedSections,
         'data' => $parsedData,
     ]);
@@ -199,96 +215,280 @@ try {
 // ========== Helper Functions ==========
 
 /**
- * Extract text from PDF using LangExtract or fallback methods
+ * Call DeepSeek AI to extract structured data from contract text
  */
-function extractTextFromPdf($filePath) {
-    // Method 1: Try LangExtract Python engine (open source)
-    $langExtractResult = tryLangExtract($filePath);
-    if ($langExtractResult) return $langExtractResult;
+function callDeepSeekExtraction($text, $contract) {
+    $apiKey = defined('DEEPSEEK_API_KEY') ? DEEPSEEK_API_KEY : '';
+    if (empty($apiKey)) {
+        throw new Exception('DeepSeek API key not configured');
+    }
 
-    // Method 2: Fallback to pdftotext (poppler-utils)
-    $pdftotextResult = tryPdftotext($filePath);
-    if ($pdftotextResult) return $pdftotextResult;
+    $systemPrompt = <<<'PROMPT'
+You are a hotel/lodge rate contract data extraction expert. You will receive raw text extracted from a PDF rate contract for a safari lodge, hotel, or camp. Your job is to extract ALL structured data and return it as a single JSON object.
 
-    // Method 3: Fallback to basic PHP PDF parsing
-    $phpResult = tryPhpPdfParse($filePath);
-    if ($phpResult) return $phpResult;
+Return ONLY valid JSON with this exact structure (omit sections that have no data):
 
-    return '';
+{
+  "header": {
+    "property_name": "string - hotel/lodge/camp name",
+    "currency": "string - 3-letter code e.g. USD, EUR, GBP, TZS",
+    "validity_start": "string - YYYY-MM-DD format",
+    "validity_end": "string - YYYY-MM-DD format",
+    "rate_basis": "string - one of: net, rack, commissionable",
+    "market": "string - target market if mentioned e.g. International, Domestic"
+  },
+  "room_types": [
+    {
+      "room_name": "string - exact room/tent/suite name",
+      "room_category": "string - one of: standard, deluxe, suite, villa, tented, cottage, bungalow, chalet, family",
+      "max_occupancy": "integer or null",
+      "bed_config": "string or null - e.g. King, Twin, Double",
+      "description": "string or null",
+      "sort_order": "integer starting from 0"
+    }
+  ],
+  "seasons": [
+    {
+      "season_name": "string - e.g. Peak Season, High Season",
+      "season_type": "string - one of: peak, high, mid, low, green, festive, special",
+      "start_date": "string - YYYY-MM-DD",
+      "end_date": "string - YYYY-MM-DD",
+      "notes": "string or null",
+      "sort_order": "integer starting from 0"
+    }
+  ],
+  "rates": [
+    {
+      "room_name": "string - must match a room_types entry exactly",
+      "season_name": "string - must match a seasons entry exactly",
+      "meal_plan": "string - one of: RO, BB, HB, FB, AI (Room Only, Bed&Breakfast, Half Board, Full Board, All Inclusive)",
+      "rate_pps": "number or null - rate per person sharing",
+      "rate_single": "number or null - single occupancy rate",
+      "rate_double": "number or null - double/twin room rate",
+      "rate_triple": "number or null - triple occupancy rate",
+      "rate_child": "number or null - child rate",
+      "rate_infant": "number or null - infant rate",
+      "rate_single_supplement": "number or null",
+      "rate_extra_bed": "number or null",
+      "rate_extra_adult": "number or null",
+      "currency": "string - 3-letter code",
+      "min_nights": "integer or null",
+      "notes": "string or null"
+    }
+  ],
+  "child_policies": [
+    {
+      "age_from": "integer",
+      "age_to": "integer",
+      "policy_type": "string - one of: free, percentage, fixed",
+      "sharing_with_1_adult": "number or null - percentage or fixed amount",
+      "sharing_with_2_adults": "number or null - percentage or fixed amount",
+      "own_room": "number or null",
+      "fixed_rate": "number or null",
+      "max_children_per_room": "integer or null",
+      "currency": "string or null",
+      "notes": "string or null"
+    }
+  ],
+  "special_supplements": [
+    {
+      "supplement_name": "string - e.g. Christmas Supplement, Easter Surcharge",
+      "supplement_type": "string - one of: fixed_per_night, fixed_per_stay, percentage",
+      "amount": "number or null",
+      "percentage": "number or null",
+      "start_date": "string or null - YYYY-MM-DD",
+      "end_date": "string or null - YYYY-MM-DD",
+      "applies_to": "string or null - e.g. all_guests, adults_only",
+      "currency": "string or null",
+      "notes": "string or null"
+    }
+  ],
+  "cancellation_policies": [
+    {
+      "days_before_from": "integer - e.g. 60",
+      "days_before_to": "integer - e.g. 90",
+      "charge_type": "string - one of: percentage, fixed, full_charge, no_charge",
+      "charge_value": "number - percentage (0-100) or fixed amount",
+      "currency": "string or null",
+      "notes": "string or null",
+      "sort_order": "integer starting from 0"
+    }
+  ],
+  "activities": [
+    {
+      "activity_name": "string",
+      "category": "string or null - e.g. Game Drive, Walking Safari, Boat Trip",
+      "rate_adult": "number or null",
+      "rate_child": "number or null",
+      "rate_per_vehicle": "number or null",
+      "min_pax": "integer or null",
+      "duration": "string or null",
+      "included_in_package": "boolean - true if included in room rate",
+      "currency": "string or null",
+      "notes": "string or null"
+    }
+  ],
+  "park_fees": [
+    {
+      "fee_name": "string - e.g. Park Entry Fee, Concession Fee, Conservation Fee",
+      "fee_type": "string - one of: park_entry, concession, conservation, community, other",
+      "rate_adult": "number or null",
+      "rate_child": "number or null",
+      "child_age_limit": "integer or null",
+      "per_unit": "string - one of: per_person_per_day, per_person_per_stay, per_vehicle",
+      "high_season_rate_adult": "number or null",
+      "high_season_rate_child": "number or null",
+      "included_in_rate": "boolean - true if included in room rate",
+      "currency": "string or null",
+      "notes": "string or null"
+    }
+  ],
+  "policies": [
+    {
+      "policy_type": "string - e.g. check_in_time, check_out_time, minimum_stay, payment_terms, deposit, children_policy",
+      "policy_value": "string - the actual value",
+      "notes": "string or null"
+    }
+  ]
 }
 
-/**
- * Try LangExtract open-source extraction engine
- * Requires: pip install langextract
- */
-function tryLangExtract($filePath) {
-    $escapedPath = escapeshellarg($filePath);
+IMPORTANT RULES:
+- Extract EVERY rate, room, season, and policy you can find. Be thorough.
+- All dates must be in YYYY-MM-DD format. If only month/day given, assume the contract's validity year.
+- All monetary values must be numbers without currency symbols.
+- room_name in rates must EXACTLY match a room_name in room_types.
+- season_name in rates must EXACTLY match a season_name in seasons.
+- If rates are "per person sharing" (pps/ppps/pppn), put the value in rate_pps.
+- If the contract shows rates in a table format, extract EVERY cell/combination.
+- Return ONLY the JSON object, no markdown, no explanation.
+PROMPT;
 
-    // Try langextract CLI
-    $cmd = "langextract extract {$escapedPath} --format json 2>/dev/null";
-    $output = shell_exec($cmd);
+    $userMessage = "Extract all rate contract data from this PDF text. The contract is for property: \"{$contract['property_name']}\", currency hint: \"{$contract['currency']}\".\n\n--- PDF TEXT START ---\n{$text}\n--- PDF TEXT END ---";
 
-    if ($output) {
-        $decoded = json_decode($output, true);
-        if ($decoded && !empty($decoded['text'])) {
-            return $decoded['text'];
+    $payload = [
+        'model' => 'deepseek-chat',
+        'messages' => [
+            ['role' => 'system', 'content' => $systemPrompt],
+            ['role' => 'user', 'content' => $userMessage],
+        ],
+        'response_format' => ['type' => 'json_object'],
+        'max_tokens' => 8192,
+        'temperature' => 0.1,
+    ];
+
+    $ch = curl_init('https://api.deepseek.com/chat/completions');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => json_encode($payload),
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/json',
+            'Authorization: Bearer ' . $apiKey,
+        ],
+        CURLOPT_TIMEOUT => 180, // 3 minutes for large contracts
+        CURLOPT_CONNECTTIMEOUT => 15,
+    ]);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlError) {
+        throw new Exception("DeepSeek API connection error: {$curlError}");
+    }
+
+    if ($httpCode !== 200) {
+        $errBody = json_decode($response, true);
+        $errMsg = $errBody['error']['message'] ?? $errBody['error'] ?? "HTTP {$httpCode}";
+        throw new Exception("DeepSeek API error: {$errMsg}");
+    }
+
+    $result = json_decode($response, true);
+    if (empty($result['choices'][0]['message']['content'])) {
+        throw new Exception('DeepSeek returned an empty response');
+    }
+
+    $content = $result['choices'][0]['message']['content'];
+    $parsed = json_decode($content, true);
+
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        // Try to extract JSON from markdown code blocks
+        if (preg_match('/```(?:json)?\s*([\s\S]+?)\s*```/', $content, $m)) {
+            $parsed = json_decode($m[1], true);
         }
-        if ($decoded && !empty($decoded['content'])) {
-            return $decoded['content'];
-        }
-        // If output is plain text
-        if (strlen($output) > 100) {
-            return $output;
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new Exception('DeepSeek returned invalid JSON: ' . json_last_error_msg());
         }
     }
 
-    // Try Python script approach
-    $pyScript = <<<'PYTHON'
-import sys
-import json
-try:
-    from langextract import extract
-    result = extract(sys.argv[1])
-    print(json.dumps({"text": result.text, "metadata": result.metadata if hasattr(result, 'metadata') else {}}))
-except ImportError:
-    try:
-        import pdfplumber
-        with pdfplumber.open(sys.argv[1]) as pdf:
-            text = ""
-            for page in pdf.pages:
-                text += page.extract_text() or ""
-                text += "\n---PAGE_BREAK---\n"
-                tables = page.extract_tables()
-                for table in tables:
-                    text += "\n---TABLE_START---\n"
-                    for row in table:
-                        text += "\t".join([str(cell or "") for cell in row]) + "\n"
-                    text += "---TABLE_END---\n"
-            print(json.dumps({"text": text}))
-    except ImportError:
-        try:
-            import PyPDF2
-            reader = PyPDF2.PdfReader(sys.argv[1])
-            text = ""
-            for page in reader.pages:
-                text += page.extract_text() or ""
-                text += "\n---PAGE_BREAK---\n"
-            print(json.dumps({"text": text}))
-        except Exception as e:
-            print(json.dumps({"error": str(e)}))
-PYTHON;
+    return $parsed;
+}
 
-    $tmpScript = tempnam(sys_get_temp_dir(), 'le_') . '.py';
-    file_put_contents($tmpScript, $pyScript);
-    $escapedScript = escapeshellarg($tmpScript);
+/**
+ * Link rates to room_type_id and season_id by matching names
+ */
+function linkRatesToIds($pdo, $contractId, $rates) {
+    // Get saved room types
+    $stmt = $pdo->prepare("SELECT id, room_name FROM contract_room_types WHERE contract_id = ?");
+    $stmt->execute([$contractId]);
+    $roomMap = [];
+    foreach ($stmt->fetchAll() as $row) {
+        $roomMap[strtolower(trim($row['room_name']))] = $row['id'];
+    }
 
-    $output = shell_exec("python3 {$escapedScript} {$escapedPath} 2>/dev/null");
-    @unlink($tmpScript);
+    // Get saved seasons
+    $stmt = $pdo->prepare("SELECT id, season_name FROM contract_seasons WHERE contract_id = ?");
+    $stmt->execute([$contractId]);
+    $seasonMap = [];
+    foreach ($stmt->fetchAll() as $row) {
+        $seasonMap[strtolower(trim($row['season_name']))] = $row['id'];
+    }
 
-    if ($output) {
-        $decoded = json_decode($output, true);
-        if ($decoded && !empty($decoded['text'])) {
-            return $decoded['text'];
+    $linked = [];
+    foreach ($rates as $rate) {
+        $roomName = strtolower(trim($rate['room_name'] ?? ''));
+        $seasonName = strtolower(trim($rate['season_name'] ?? ''));
+
+        // Find best match (exact or partial)
+        $roomId = $roomMap[$roomName] ?? findClosestMatch($roomName, $roomMap);
+        $seasonId = $seasonMap[$seasonName] ?? findClosestMatch($seasonName, $seasonMap);
+
+        $rate['room_type_id'] = $roomId;
+        $rate['season_id'] = $seasonId;
+
+        // Remove string fields that aren't in the DB
+        unset($rate['room_name'], $rate['season_name']);
+
+        $linked[] = $rate;
+    }
+
+    return $linked;
+}
+
+/**
+ * Find the closest matching key in a map using substring matching
+ */
+function findClosestMatch($needle, $map) {
+    if (empty($needle) || empty($map)) return null;
+
+    foreach ($map as $key => $id) {
+        if (strpos($key, $needle) !== false || strpos($needle, $key) !== false) {
+            return $id;
+        }
+    }
+
+    // Try word-by-word matching
+    $needleWords = explode(' ', $needle);
+    foreach ($map as $key => $id) {
+        $matchCount = 0;
+        foreach ($needleWords as $word) {
+            if (strlen($word) > 2 && strpos($key, $word) !== false) {
+                $matchCount++;
+            }
+        }
+        if ($matchCount >= count($needleWords) * 0.5) {
+            return $id;
         }
     }
 
@@ -296,7 +496,26 @@ PYTHON;
 }
 
 /**
- * Try pdftotext (poppler-utils) as fallback
+ * Extract text from PDF using available methods
+ */
+function extractTextFromPdf($filePath) {
+    // Method 1: pdftotext (poppler-utils) - best for text-based PDFs
+    $result = tryPdftotext($filePath);
+    if ($result) return $result;
+
+    // Method 2: Python pdfplumber (if available) - good for tables
+    $result = tryPythonPdfExtract($filePath);
+    if ($result) return $result;
+
+    // Method 3: Basic PHP PDF parsing (last resort)
+    $result = tryPhpPdfParse($filePath);
+    if ($result) return $result;
+
+    return '';
+}
+
+/**
+ * Try pdftotext (poppler-utils)
  */
 function tryPdftotext($filePath) {
     $escapedPath = escapeshellarg($filePath);
@@ -305,18 +524,68 @@ function tryPdftotext($filePath) {
 }
 
 /**
- * Basic PHP PDF text extraction (rudimentary)
+ * Try Python pdfplumber for better table extraction
+ */
+function tryPythonPdfExtract($filePath) {
+    $escapedPath = escapeshellarg($filePath);
+
+    $pyScript = <<<'PYTHON'
+import sys, json
+try:
+    import pdfplumber
+    with pdfplumber.open(sys.argv[1]) as pdf:
+        text = ""
+        for i, page in enumerate(pdf.pages):
+            text += page.extract_text() or ""
+            text += "\n"
+            tables = page.extract_tables()
+            for table in tables:
+                text += "\n[TABLE]\n"
+                for row in table:
+                    text += "\t".join([str(cell or "") for cell in row]) + "\n"
+                text += "[/TABLE]\n"
+            text += "\n---\n"
+    print(json.dumps({"text": text}))
+except ImportError:
+    try:
+        import PyPDF2
+        reader = PyPDF2.PdfReader(sys.argv[1])
+        text = ""
+        for page in reader.pages:
+            text += (page.extract_text() or "") + "\n---\n"
+        print(json.dumps({"text": text}))
+    except:
+        print(json.dumps({"error": "no pdf library"}))
+PYTHON;
+
+    $tmpScript = tempnam(sys_get_temp_dir(), 'pdf_') . '.py';
+    file_put_contents($tmpScript, $pyScript);
+    $escapedScript = escapeshellarg($tmpScript);
+
+    $output = shell_exec("python3 {$escapedScript} {$escapedPath} 2>/dev/null");
+    @unlink($tmpScript);
+
+    if ($output) {
+        $decoded = json_decode($output, true);
+        if ($decoded && !empty($decoded['text']) && strlen($decoded['text']) > 50) {
+            return $decoded['text'];
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Basic PHP PDF text extraction (last resort)
  */
 function tryPhpPdfParse($filePath) {
     $content = file_get_contents($filePath);
     if (!$content) return null;
 
-    // Extract text between BT and ET markers (basic PDF text extraction)
     $text = '';
     preg_match_all('/BT\s*(.*?)\s*ET/s', $content, $matches);
     if (!empty($matches[1])) {
         foreach ($matches[1] as $block) {
-            // Extract strings between parentheses
             preg_match_all('/\(([^)]*)\)/', $block, $strings);
             if (!empty($strings[1])) {
                 $text .= implode(' ', $strings[1]) . "\n";
@@ -328,301 +597,37 @@ function tryPhpPdfParse($filePath) {
 }
 
 /**
- * Parse extracted text into structured contract data
- */
-function parseContractText($text, $contract) {
-    $result = [
-        'header' => [],
-        'room_types' => [],
-        'seasons' => [],
-        'rates' => [],
-        'child_policies' => [],
-        'special_supplements' => [],
-        'cancellation_policies' => [],
-        'activities' => [],
-        'park_fees' => [],
-        'policies' => [],
-    ];
-
-    $textLower = strtolower($text);
-    $lines = explode("\n", $text);
-
-    // ----- Header extraction -----
-    // Property name
-    foreach ($lines as $line) {
-        $line = trim($line);
-        if (preg_match('/(?:hotel|lodge|camp|resort|inn)\s*:?\s*(.+)/i', $line, $m)) {
-            $result['header']['property_name'] = trim($m[1]);
-            break;
-        }
-    }
-
-    // Currency
-    if (preg_match('/(?:currency|rates?\s+in|all\s+rates?\s+(?:are\s+)?in)\s*:?\s*(\w{3})/i', $text, $m)) {
-        $result['header']['currency'] = strtoupper($m[1]);
-    }
-
-    // Validity period
-    if (preg_match('/(?:valid(?:ity)?|effective|period)\s*:?\s*(\d{1,2}[\s\/\-\.]\w+[\s\/\-\.]\d{2,4})\s*(?:to|[-\u2013]|through|until)\s*(\d{1,2}[\s\/\-\.]\w+[\s\/\-\.]\d{2,4})/i', $text, $m)) {
-        $result['header']['validity_start'] = parseDate($m[1]);
-        $result['header']['validity_end'] = parseDate($m[2]);
-    }
-
-    // Rate basis
-    if (stripos($text, 'net rate') !== false || stripos($text, 'non-commissionable') !== false) {
-        $result['header']['rate_basis'] = 'net';
-    } elseif (stripos($text, 'rack rate') !== false) {
-        $result['header']['rate_basis'] = 'rack';
-    } elseif (stripos($text, 'commissionable') !== false) {
-        $result['header']['rate_basis'] = 'commissionable';
-    }
-
-    // ----- Room Types -----
-    $roomPatterns = [
-        '/(?:single|double|twin|triple|family|suite|standard|deluxe|superior|executive|premium|cottage|bungalow|tent(?:ed)?|chalet|villa|honeymoon|plantation)\s*(?:room|tent|chalet|cottage|bungalow|suite|villa)?/i'
-    ];
-    $foundRooms = [];
-    foreach ($lines as $line) {
-        foreach ($roomPatterns as $pattern) {
-            if (preg_match($pattern, trim($line), $m)) {
-                $roomName = trim($m[0]);
-                $roomName = ucwords(strtolower($roomName));
-                if (strlen($roomName) > 3 && !in_array($roomName, $foundRooms)) {
-                    $foundRooms[] = $roomName;
-                    $result['room_types'][] = [
-                        'room_name' => $roomName,
-                        'room_category' => categorizeRoom($roomName),
-                        'sort_order' => count($result['room_types']),
-                    ];
-                }
-            }
-        }
-    }
-
-    // ----- Seasons -----
-    $seasonPatterns = [
-        'peak' => '/peak\s+season\s*:?\s*(\d{1,2}[\s\/\-\.]\w+[\s\/\-\.]*\d{0,4})\s*(?:to|[-\u2013]|through)\s*(\d{1,2}[\s\/\-\.]\w+[\s\/\-\.]*\d{0,4})/i',
-        'high' => '/high\s+season\s*:?\s*(\d{1,2}[\s\/\-\.]\w+[\s\/\-\.]*\d{0,4})\s*(?:to|[-\u2013]|through)\s*(\d{1,2}[\s\/\-\.]\w+[\s\/\-\.]*\d{0,4})/i',
-        'mid' => '/(?:mid|shoulder)\s+season\s*:?\s*(\d{1,2}[\s\/\-\.]\w+[\s\/\-\.]*\d{0,4})\s*(?:to|[-\u2013]|through)\s*(\d{1,2}[\s\/\-\.]\w+[\s\/\-\.]*\d{0,4})/i',
-        'low' => '/(?:low|green)\s+season\s*:?\s*(\d{1,2}[\s\/\-\.]\w+[\s\/\-\.]*\d{0,4})\s*(?:to|[-\u2013]|through)\s*(\d{1,2}[\s\/\-\.]\w+[\s\/\-\.]*\d{0,4})/i',
-    ];
-
-    foreach ($seasonPatterns as $type => $pattern) {
-        if (preg_match_all($pattern, $text, $matches, PREG_SET_ORDER)) {
-            foreach ($matches as $idx => $m) {
-                $result['seasons'][] = [
-                    'season_name' => ucfirst($type) . ' Season' . ($idx > 0 ? ' ' . ($idx + 1) : ''),
-                    'season_type' => $type,
-                    'start_date' => parseDate($m[1]),
-                    'end_date' => parseDate($m[2]),
-                    'sort_order' => count($result['seasons']),
-                ];
-            }
-        }
-    }
-
-    // ----- Rates (numeric extraction from tables) -----
-    // Look for rate tables with USD amounts
-    preg_match_all('/\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\s*(?:per\s+person|pp|pps|pppn)/i', $text, $rateMatches);
-    // Store raw rate values for manual review
-
-    // ----- Child Policies -----
-    $childPatterns = [
-        '/(?:child(?:ren)?)\s*(?:under|below|aged?)\s*(\d+)\s*(?:years?)?\s*(?:are?\s*)?(?:free|complimentary|no\s+charge)/i',
-        '/(?:child(?:ren)?)\s*(?:aged?)\s*(\d+)\s*(?:to|-)\s*(\d+)\s*(?:years?)?\s*:?\s*(\d+)%?\s*(?:of\s+adult\s+rate)?/i',
-    ];
-
-    foreach ($lines as $line) {
-        // Free children
-        if (preg_match('/child(?:ren)?\s+(?:under|below|aged?\s+\d+\s*(?:to|-)\s*)\s*(\d+)\s*(?:years?)?\s*(?:are?\s*)?(?:free|complimentary|no\s+charge|foc)/i', $line, $m)) {
-            $result['child_policies'][] = [
-                'age_from' => 0,
-                'age_to' => (int)$m[1],
-                'policy_type' => 'free',
-                'sharing_with_2_adults' => 0,
-                'notes' => trim($line),
-            ];
-        }
-        // Percentage child rate
-        if (preg_match('/child(?:ren)?\s+(?:aged?\s*)?(\d+)\s*(?:to|-)\s*(\d+)\s*(?:years?)?\s*:?\s*(\d+)\s*%/i', $line, $m)) {
-            $result['child_policies'][] = [
-                'age_from' => (int)$m[1],
-                'age_to' => (int)$m[2],
-                'policy_type' => 'percentage',
-                'sharing_with_2_adults' => (float)$m[3],
-                'notes' => trim($line),
-            ];
-        }
-    }
-
-    // ----- Special Supplements -----
-    $supplementNames = ['easter', 'christmas', 'new year', 'festive', 'gala dinner'];
-    foreach ($supplementNames as $name) {
-        if (preg_match('/' . preg_quote($name, '/') . '\s+(?:supplement|surcharge)\s*:?\s*(?:USD?\s*)?\$?\s*(\d+(?:\.\d{2})?)/i', $text, $m)) {
-            $result['special_supplements'][] = [
-                'supplement_name' => ucwords($name) . ' Supplement',
-                'supplement_type' => 'fixed_per_night',
-                'amount' => (float)$m[1],
-                'currency' => $contract['currency'] ?? 'USD',
-            ];
-        }
-    }
-
-    // ----- Cancellation Policies -----
-    // Look for patterns like "90+ days: no charge", "60-90 days: 25%", etc.
-    preg_match_all('/(\d+)\s*(?:to|-)\s*(\d+)\s*(?:days?\s+(?:before|prior|in advance))?\s*:?\s*(\d+)\s*%/i', $text, $cancelMatches, PREG_SET_ORDER);
-    $cancelOrder = 0;
-    foreach ($cancelMatches as $cm) {
-        // Only capture if in cancellation context
-        $contextCheck = false;
-        foreach ($lines as $lineNum => $line) {
-            if (stripos($line, $cm[0]) !== false) {
-                // Look back a few lines for cancellation heading
-                for ($i = max(0, $lineNum - 5); $i <= $lineNum; $i++) {
-                    if (preg_match('/cancel/i', $lines[$i])) {
-                        $contextCheck = true;
-                        break;
-                    }
-                }
-                break;
-            }
-        }
-        if ($contextCheck) {
-            $result['cancellation_policies'][] = [
-                'days_before_from' => (int)$cm[1],
-                'days_before_to' => (int)$cm[2],
-                'charge_type' => 'percentage',
-                'charge_value' => (float)$cm[3],
-                'sort_order' => $cancelOrder++,
-            ];
-        }
-    }
-
-    // ----- Activities -----
-    $activityKeywords = ['game drive', 'safari', 'walking', 'boat', 'fishing', 'horse riding',
-                        'kayaking', 'snorkeling', 'diving', 'spa', 'massage', 'yoga',
-                        'cultural visit', 'bird watching', 'night drive'];
-    foreach ($activityKeywords as $keyword) {
-        if (preg_match('/' . preg_quote($keyword, '/') . '\s*(?:[-:]\s*)?(?:USD?\s*)?\$?\s*(\d+(?:\.\d{2})?)\s*(?:per\s+person|pp)?/i', $text, $m)) {
-            $result['activities'][] = [
-                'activity_name' => ucwords($keyword),
-                'rate_adult' => (float)$m[1],
-                'currency' => $contract['currency'] ?? 'USD',
-            ];
-        }
-    }
-
-    // ----- Park Fees -----
-    if (preg_match('/park\s+(?:entry|entrance)\s+fee\s*:?\s*(?:USD?\s*)?\$?\s*(\d+(?:\.\d{2})?)\s*(?:per\s+person)?/i', $text, $m)) {
-        $result['park_fees'][] = [
-            'fee_name' => 'Park Entry Fee',
-            'fee_type' => 'park_entry',
-            'rate_adult' => (float)$m[1],
-            'per_unit' => 'per_person_per_day',
-            'currency' => $contract['currency'] ?? 'USD',
-        ];
-    }
-    if (preg_match('/concession\s+fee\s*:?\s*(?:USD?\s*)?\$?\s*(\d+(?:\.\d{2})?)/i', $text, $m)) {
-        $result['park_fees'][] = [
-            'fee_name' => 'Concession Fee',
-            'fee_type' => 'concession',
-            'rate_adult' => (float)$m[1],
-            'per_unit' => 'per_person_per_day',
-            'currency' => $contract['currency'] ?? 'USD',
-        ];
-    }
-
-    // ----- Policies -----
-    // Check-in/out
-    if (preg_match('/check[\s-]*in\s*(?:time)?\s*:?\s*(\d{1,2}[:.]\d{2}\s*(?:hrs?|am|pm)?)/i', $text, $m)) {
-        $result['policies'][] = [
-            'policy_type' => 'check_in_time',
-            'policy_value' => trim($m[1]),
-        ];
-    }
-    if (preg_match('/check[\s-]*out\s*(?:time)?\s*:?\s*(\d{1,2}[:.]\d{2}\s*(?:hrs?|am|pm)?)/i', $text, $m)) {
-        $result['policies'][] = [
-            'policy_type' => 'check_out_time',
-            'policy_value' => trim($m[1]),
-        ];
-    }
-
-    return $result;
-}
-
-/**
- * Categorize a room type name
- */
-function categorizeRoom($name) {
-    $name = strtolower($name);
-    if (strpos($name, 'suite') !== false) return 'suite';
-    if (strpos($name, 'villa') !== false) return 'villa';
-    if (strpos($name, 'tent') !== false) return 'tented';
-    if (strpos($name, 'cottage') !== false) return 'cottage';
-    if (strpos($name, 'bungalow') !== false) return 'bungalow';
-    if (strpos($name, 'chalet') !== false) return 'chalet';
-    if (strpos($name, 'family') !== false) return 'family';
-    return 'standard';
-}
-
-/**
- * Parse a date string into Y-m-d format
- */
-function parseDate($dateStr) {
-    $dateStr = trim($dateStr);
-    $months = [
-        'jan' => '01', 'feb' => '02', 'mar' => '03', 'apr' => '04',
-        'may' => '05', 'jun' => '06', 'jul' => '07', 'aug' => '08',
-        'sep' => '09', 'oct' => '10', 'nov' => '11', 'dec' => '12',
-        'january' => '01', 'february' => '02', 'march' => '03', 'april' => '04',
-        'june' => '06', 'july' => '07', 'august' => '08', 'september' => '09',
-        'october' => '10', 'november' => '11', 'december' => '12',
-    ];
-
-    // Try common formats
-    $formats = ['d/m/Y', 'd-m-Y', 'Y-m-d', 'd.m.Y', 'm/d/Y'];
-    foreach ($formats as $fmt) {
-        $d = DateTime::createFromFormat($fmt, $dateStr);
-        if ($d) return $d->format('Y-m-d');
-    }
-
-    // Try "1 January 2026" or "1st Jan 2026" format
-    if (preg_match('/(\d{1,2})(?:st|nd|rd|th)?\s+(\w+)\s+(\d{2,4})/i', $dateStr, $m)) {
-        $day = str_pad($m[1], 2, '0', STR_PAD_LEFT);
-        $monthKey = strtolower(substr($m[2], 0, 3));
-        $month = $months[$monthKey] ?? null;
-        $year = strlen($m[3]) === 2 ? '20' . $m[3] : $m[3];
-        if ($month) {
-            return "{$year}-{$month}-{$day}";
-        }
-    }
-
-    return null;
-}
-
-/**
  * Save a section of data to the database
  */
 function saveSection($pdo, $contractId, $table, $items, $fields) {
     // Clear existing
     $pdo->prepare("DELETE FROM {$table} WHERE contract_id = ?")->execute([$contractId]);
 
+    $sortIdx = 0;
     foreach ($items as $item) {
         $cols = ['contract_id'];
         $placeholders = ['?'];
         $values = [$contractId];
 
+        // Auto-add sort_order if field is expected but not provided
+        if (in_array('sort_order', $fields) && !isset($item['sort_order'])) {
+            $item['sort_order'] = $sortIdx++;
+        }
+
         foreach ($fields as $f) {
-            if (isset($item[$f])) {
+            if (isset($item[$f]) && $item[$f] !== null && $item[$f] !== '') {
                 $cols[] = $f;
                 $placeholders[] = '?';
                 $val = $item[$f];
                 if (is_array($val)) $val = json_encode($val);
+                if (is_bool($val)) $val = $val ? 1 : 0;
                 $values[] = $val;
             }
         }
 
-        $sql = "INSERT INTO {$table} (" . implode(', ', $cols) . ") VALUES (" . implode(', ', $placeholders) . ")";
-        $pdo->prepare($sql)->execute($values);
+        if (count($cols) > 1) { // Only insert if we have data beyond contract_id
+            $sql = "INSERT INTO {$table} (" . implode(', ', $cols) . ") VALUES (" . implode(', ', $placeholders) . ")";
+            $pdo->prepare($sql)->execute($values);
+        }
     }
 }

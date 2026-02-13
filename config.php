@@ -10,6 +10,9 @@ define('JWT_SECRET', 'safaribrew-jwt-secret-change-in-production-2026');
 define('JWT_EXPIRY', 8 * 3600); // 8 hours
 define('BASE_URL', 'http://localhost:8000');
 
+// DeepSeek AI (for AI Brew extraction)
+define('DEEPSEEK_API_KEY', 'sk-e25579a5c6854fd7a4d78cb5bdb08a77');
+
 // CORS
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');

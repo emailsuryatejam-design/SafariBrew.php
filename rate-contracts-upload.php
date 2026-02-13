@@ -40,9 +40,9 @@ if (!in_array($mimeType, $allowedTypes)) {
     jsonError('Only PDF files are allowed', 400);
 }
 
-$maxSize = 20 * 1024 * 1024; // 20MB
-if ($file['size'] > $maxSize) {
-    jsonError('File size exceeds 20MB limit', 400);
+$hardLimit = 100 * 1024 * 1024; // 100MB hard limit before any processing
+if ($file['size'] > $hardLimit) {
+    jsonError('File size exceeds 100MB hard limit', 400);
 }
 
 // Create uploads directory
@@ -59,6 +59,30 @@ $targetPath = $uploadDir . '/' . $uniqueName;
 
 if (!move_uploaded_file($file['tmp_name'], $targetPath)) {
     jsonError('Failed to save file', 500);
+}
+
+// Compress PDF if larger than 50MB using Ghostscript
+$maxSize = 50 * 1024 * 1024; // 50MB
+if (filesize($targetPath) > $maxSize) {
+    $compressedPath = $targetPath . '.compressed.pdf';
+    $escaped = escapeshellarg($targetPath);
+    $escapedOut = escapeshellarg($compressedPath);
+    $gsCmd = "gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dQUIET -dBATCH -sOutputFile={$escapedOut} {$escaped} 2>/dev/null";
+    exec($gsCmd, $gsOutput, $gsReturn);
+
+    if ($gsReturn === 0 && file_exists($compressedPath) && filesize($compressedPath) < filesize($targetPath)) {
+        // Replace original with compressed version
+        unlink($targetPath);
+        rename($compressedPath, $targetPath);
+    } else {
+        // Cleanup failed compression
+        @unlink($compressedPath);
+        // If still over 50MB, reject
+        if (filesize($targetPath) > $maxSize) {
+            unlink($targetPath);
+            jsonError('File size exceeds 50MB and could not be compressed. Please reduce the file size manually.', 400);
+        }
+    }
 }
 
 $fileUrl = BASE_URL . '/uploads/contracts/' . $uniqueName;
