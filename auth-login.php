@@ -14,11 +14,14 @@ if (!$user || !password_verify($data['password'], $user['password_hash'])) {
     jsonError('Invalid email or password', 401);
 }
 
+$isSuperadmin = !empty($user['is_superadmin']);
+
 $token = jwtEncode([
     'user_id' => $user['id'],
     'branch_id' => $user['branch_id'],
     'role' => $user['role'],
     'name' => $user['full_name'],
+    'is_superadmin' => $isSuperadmin,
 ]);
 
 // Get active modules for this branch
@@ -48,6 +51,7 @@ jsonResponse([
         'branch_currency' => $user['branch_currency'],
         'quote_color' => $user['quote_color'],
         'branch_logo' => $user['branch_logo'],
+        'is_superadmin' => $isSuperadmin,
     ],
     'modules' => $modules,
     'wallet_balance' => $walletBalance,

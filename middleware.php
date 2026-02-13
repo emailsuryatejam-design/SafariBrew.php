@@ -49,6 +49,18 @@ function requireSalesOrAbove() {
 }
 
 /**
+ * Require the current user to be a platform superadmin.
+ * Superadmin flag is stored in JWT and verified against DB.
+ */
+function requireSuperadmin() {
+    $auth = requireAuth();
+    if (empty($auth['is_superadmin'])) {
+        jsonError('Superadmin access required', 403);
+    }
+    return $auth;
+}
+
+/**
  * Check if the authenticated user's branch has access to a module.
  * Module names: core, crm, content, rate_management, quoting, finance, ai_brew
  */

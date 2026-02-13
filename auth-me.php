@@ -6,7 +6,7 @@ $auth = requireAuth();
 $pdo = getDB();
 
 $stmt = $pdo->prepare("
-    SELECT u.id, u.full_name, u.email, u.role, u.phone, u.avatar_url, u.branch_id,
+    SELECT u.id, u.full_name, u.email, u.role, u.phone, u.avatar_url, u.branch_id, u.is_superadmin,
            b.name as branch_name, b.company_name, b.currency, b.quote_color, b.quote_font,
            b.logo_url, b.email as branch_email, b.phone as branch_phone,
            b.address, b.website, b.country
@@ -47,6 +47,7 @@ jsonResponse([
         'branch_currency' => $user['currency'],
         'quote_color' => $user['quote_color'],
         'branch_logo' => $user['logo_url'],
+        'is_superadmin' => !empty($user['is_superadmin']),
     ],
     'branch' => [
         'company_name' => $user['company_name'],
