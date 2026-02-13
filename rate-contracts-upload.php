@@ -89,10 +89,16 @@ $fileUrl = BASE_URL . '/uploads/contracts/' . $uniqueName;
 
 // Get extraction mode from form data — all other fields are optional (AI extracts them)
 $extractionMode = $_POST['extraction_mode'] ?? 'ai_brew';
-$rawName = pathinfo($file['name'], PATHINFO_FILENAME);
-$propertyName = !empty($_POST['property_name']) ? $_POST['property_name'] : preg_replace('/[_-]+/', ' ', $rawName);
 $accommodationId = !empty($_POST['accommodation_id']) ? (int)$_POST['accommodation_id'] : null;
 $contractType = !empty($_POST['contract_type']) ? $_POST['contract_type'] : null;
+
+// For AI Brew: property name comes from the document, not the filename
+// Use a temporary placeholder that the extraction worker will overwrite
+if ($extractionMode === 'ai_brew') {
+    $propertyName = !empty($_POST['property_name']) ? $_POST['property_name'] : 'Brewing — ' . $file['name'];
+} else {
+    $propertyName = !empty($_POST['property_name']) ? $_POST['property_name'] : preg_replace('/[_-]+/', ' ', pathinfo($file['name'], PATHINFO_FILENAME));
+}
 
 // Create the contract record
 $code = generateCode('RCT', $pdo, 'rate_contracts', 'contract_code');
