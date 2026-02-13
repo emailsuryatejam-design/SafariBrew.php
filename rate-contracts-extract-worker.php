@@ -159,6 +159,10 @@ try {
 
     echo "\nAll passes complete. Sections: " . implode(', ', array_keys($parsedData)) . "\n";
 
+    // Reconnect DB — long extraction may have timed out the MySQL connection
+    $pdo = reconnectDB();
+    echo "DB reconnected for save phase\n";
+
     // ----- Step 4: Save extraction raw data -----
     $pdo->prepare("UPDATE rate_contracts SET extraction_raw = ?, extraction_status = 'completed' WHERE id = ?")
         ->execute([json_encode($parsedData), $contractId]);
@@ -267,6 +271,9 @@ try {
 
 } catch (Exception $e) {
     echo "ERROR: " . $e->getMessage() . "\n";
+
+    // Reconnect DB in case it timed out during extraction
+    try { $pdo = reconnectDB(); } catch (Exception $ignored) {}
 
     $pdo->prepare("UPDATE rate_contracts SET extraction_status = 'failed' WHERE id = ?")
         ->execute([$contractId]);
@@ -680,6 +687,18 @@ function saveSection($pdo, $contractId, $table, $items, $fields) {
             $pdo->prepare($sql)->execute($values);
         }
     }
+}
+
+/**
+ * Create a fresh DB connection (bypasses getDB() singleton which may have timed out)
+ */
+function reconnectDB() {
+    $dsn = 'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8mb4';
+    return new PDO($dsn, DB_USER, DB_PASS, [
+        PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES   => false,
+    ]);
 }
 
 function repairJson($text) {
