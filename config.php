@@ -17,7 +17,7 @@ if (file_exists(__DIR__ . '/.env.php')) {
 // Defaults (overridden by .env.php in production)
 if (!defined('BASE_URL')) define('BASE_URL', 'http://localhost:8000');
 if (!defined('GEMINI_API_KEY')) define('GEMINI_API_KEY', '');
-define('GEMINI_MODEL', 'gemini-2.0-flash');
+define('GEMINI_MODEL', 'gemini-2.5-flash');
 define('GEMINI_ENDPOINT', 'https://generativelanguage.googleapis.com/v1beta/models/' . GEMINI_MODEL . ':generateContent');
 
 // CORS

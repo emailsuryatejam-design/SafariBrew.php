@@ -235,7 +235,7 @@ try {
     // Audit log
     $pdo->prepare("INSERT INTO contract_audit_log (contract_id, user_id, action, details) VALUES (?, ?, 'ai_extracted', ?)")
         ->execute([$contractId, $userId, json_encode([
-            'engine' => 'gemini-2.0-flash-vision-chunked',
+            'engine' => 'gemini-2.5-flash-vision-chunked',
             'sections' => $savedSections,
             'pages_processed' => count($pageImages),
             'passes' => 3,
@@ -484,7 +484,7 @@ function callGeminiPass($imageParts, $promptText) {
         'contents' => [['parts' => $parts]],
         'generationConfig' => [
             'temperature' => 0.1,
-            'maxOutputTokens' => 32768,
+            'maxOutputTokens' => 65536,
             'responseMimeType' => 'application/json',
         ],
     ]);
