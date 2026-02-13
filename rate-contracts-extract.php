@@ -36,20 +36,31 @@ if ($contract['extraction_mode'] !== 'ai_brew') {
 $pdo->prepare("UPDATE rate_contracts SET extraction_status = 'processing' WHERE id = ?")
     ->execute([$contractId]);
 
-// Launch background worker via CLI
+// Launch background worker via proc_open (exec/shell_exec are disabled on Hostinger)
 $workerScript = __DIR__ . '/rate-contracts-extract-worker.php';
 $userId = (int)$auth['user_id'];
 $logFile = sys_get_temp_dir() . "/extract_{$contractId}.log";
 
 $cmd = sprintf(
-    'nohup php %s %d %d > %s 2>&1 &',
+    'php %s %d %d > %s 2>&1 &',
     escapeshellarg($workerScript),
     $contractId,
     $userId,
     escapeshellarg($logFile)
 );
 
-exec($cmd);
+$descriptors = [
+    0 => ['file', '/dev/null', 'r'],
+    1 => ['file', '/dev/null', 'w'],
+    2 => ['file', '/dev/null', 'w'],
+];
+
+$process = proc_open($cmd, $descriptors, $pipes);
+
+if (is_resource($process)) {
+    // Detach — don't wait for the worker to finish
+    proc_close($process);
+}
 
 jsonResponse([
     'message' => 'Extraction started. This will take 1-2 minutes.',

@@ -62,14 +62,14 @@ try {
 
     echo "PDF found: {$filePath} (" . filesize($filePath) . " bytes)\n";
 
-    // ----- Step 2: Convert PDF pages to images via Ghostscript -----
-    echo "Converting PDF to images...\n";
+    // ----- Step 2: Convert PDF pages to images via Imagick -----
+    echo "Converting PDF to images via Imagick...\n";
     $pageImages = convertPdfToImages($filePath);
 
     if ($tempFile) @unlink($filePath);
 
     if (empty($pageImages)) {
-        throw new Exception('Could not convert PDF to images. Is Ghostscript (gs) installed?');
+        throw new Exception('Could not convert PDF to images. Is Imagick extension available?');
     }
 
     echo "Converted " . count($pageImages) . " pages to images\n";
@@ -214,31 +214,42 @@ exit(0);
 // ========== Functions ==========
 
 function convertPdfToImages($pdfPath) {
+    if (!extension_loaded('imagick')) {
+        throw new Exception('Imagick extension not available');
+    }
+
     $tmpDir = sys_get_temp_dir();
     $prefix = 'rcpg_' . uniqid() . '_';
-    $outputPattern = "{$tmpDir}/{$prefix}%03d.png";
-
-    $cmd = sprintf(
-        'gs -sDEVICE=png16m -r200 -dNOPAUSE -dBATCH -dQUIET -dMaxBitmap=500000000 -dAlignToPixels=0 -dGridFitTT=2 -sOutputFile=%s %s 2>&1',
-        escapeshellarg($outputPattern),
-        escapeshellarg($pdfPath)
-    );
-
-    exec($cmd, $output, $returnCode);
-
-    if ($returnCode !== 0) {
-        echo "Ghostscript warning (code {$returnCode}): " . implode("\n", $output) . "\n";
-    }
-
     $images = [];
-    for ($i = 1; $i <= 50; $i++) {
-        $pageFile = sprintf("{$tmpDir}/{$prefix}%03d.png", $i);
-        if (file_exists($pageFile)) {
-            $images[] = $pageFile;
-        } else {
-            break;
-        }
+
+    $im = new Imagick();
+    $im->setResolution(200, 200); // 200 DPI before reading
+    $im->readImage($pdfPath);
+
+    $pageCount = $im->getNumberImages();
+    echo "PDF has {$pageCount} pages\n";
+
+    // Limit to 20 pages
+    $maxPages = min($pageCount, 20);
+
+    for ($i = 0; $i < $maxPages; $i++) {
+        $im->setIteratorIndex($i);
+        $im->setImageFormat('png');
+        $im->setImageCompressionQuality(85);
+
+        // Flatten to remove alpha/transparency (white background)
+        $im->setImageBackgroundColor('white');
+        $im->setImageAlphaChannel(Imagick::ALPHACHANNEL_REMOVE);
+        $im->mergeImageLayers(Imagick::LAYERMETHOD_FLATTEN);
+
+        $pageFile = sprintf("{$tmpDir}/{$prefix}%03d.png", $i + 1);
+        $im->writeImage($pageFile);
+        $images[] = $pageFile;
+        echo "  Page " . ($i + 1) . ": " . filesize($pageFile) . " bytes\n";
     }
+
+    $im->clear();
+    $im->destroy();
 
     return $images;
 }
