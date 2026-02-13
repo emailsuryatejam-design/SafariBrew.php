@@ -170,15 +170,13 @@ if ($method === 'PUT') {
     jsonResponse(['message' => 'Contract updated', 'data' => $stmt->fetch()]);
 }
 
-// DELETE - Soft archive the contract
+// DELETE - Archive or permanently delete with cascade
 if ($method === 'DELETE') {
-    $pdo->prepare("UPDATE rate_contracts SET status = 'archived' WHERE id = ? AND branch_id = ?")
-        ->execute([$id, $bid]);
-
-    $pdo->prepare("INSERT INTO contract_audit_log (contract_id, user_id, action) VALUES (?, ?, 'archived')")
-        ->execute([$id, $auth['user_id']]);
-
-    jsonResponse(['message' => 'Contract archived']);
+    require_once __DIR__ . '/rate-contracts-delete-logic.php';
+    $mode = isset($_GET['hard']) && $_GET['hard'] ? 'hard_delete' : 'archive';
+    $result = deleteContractData($pdo, $id, $mode, $auth['user_id'], $bid);
+    $msg = $mode === 'hard_delete' ? 'Contract permanently deleted' : 'Contract archived';
+    jsonResponse(['message' => $msg, 'data' => $result]);
 }
 
 jsonError('Method not allowed', 405);
