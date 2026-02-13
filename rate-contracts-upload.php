@@ -63,10 +63,11 @@ if (!move_uploaded_file($file['tmp_name'], $targetPath)) {
 
 $fileUrl = BASE_URL . '/uploads/contracts/' . $uniqueName;
 
-// Get extraction mode from form data
+// Get extraction mode and contract type from form data
 $extractionMode = $_POST['extraction_mode'] ?? 'manual';
 $propertyName = $_POST['property_name'] ?? pathinfo($file['name'], PATHINFO_FILENAME);
 $accommodationId = !empty($_POST['accommodation_id']) ? (int)$_POST['accommodation_id'] : null;
+$contractType = $_POST['contract_type'] ?? 'STO';
 
 // Create the contract record
 $code = generateCode('RCT', $pdo, 'rate_contracts', 'contract_code');
@@ -74,16 +75,17 @@ $code = generateCode('RCT', $pdo, 'rate_contracts', 'contract_code');
 $stmt = $pdo->prepare("
     INSERT INTO rate_contracts (
         branch_id, accommodation_id, contract_code, property_name,
-        status, extraction_mode, extraction_status,
+        contract_type, status, extraction_mode, extraction_status,
         original_file_url, original_file_name, file_size,
         currency, uploaded_by
-    ) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, 'USD', ?)
+    ) VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, 'USD', ?)
 ");
 $stmt->execute([
     $bid,
     $accommodationId,
     $code,
     $propertyName,
+    $contractType,
     $extractionMode,
     $extractionMode === 'ai_brew' ? 'pending' : 'completed',
     $fileUrl,
