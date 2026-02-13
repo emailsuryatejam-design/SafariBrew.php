@@ -21,6 +21,7 @@ if (php_sapi_name() !== 'cli') {
 $_SERVER['REQUEST_METHOD'] = 'CLI';
 
 require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/wallet-check.php';
 
 $contractId = (int)($argv[1] ?? 0);
 $userId = (int)($argv[2] ?? 0);
@@ -90,10 +91,28 @@ try {
     $parsedData = [];
     $propertyName = $contract['property_name'] ?? 'Unknown';
     $currencyHint = $contract['currency'] ?? 'USD';
+    $branchId = $contract['branch_id'];
+
+    // Track total token usage for wallet billing
+    $totalInputTokens = 0;
+    $totalOutputTokens = 0;
+
+    // Check wallet balance before starting (estimate cost)
+    $pageCount = count($pageImages);
+    $estimatedCost = estimateExtractionCost($pageCount);
+    $walletBalance = getWalletBalance($pdo, $branchId);
+    echo "Wallet: balance=$" . number_format($walletBalance, 4) . ", estimated cost=$" . number_format($estimatedCost, 4) . "\n";
+
+    if ($walletBalance < $estimatedCost) {
+        echo "WARNING: Wallet balance may be insufficient. Proceeding anyway (will deduct what's available).\n";
+    }
 
     // ===== PASS 1: Header + Room Types + Seasons =====
     echo "\n=== PASS 1/3: Header, Room Types, Seasons ===\n";
-    $pass1 = callGeminiPass($imageParts, buildPass1Prompt($propertyName, $currencyHint));
+    $pass1Result = callGeminiPass($imageParts, buildPass1Prompt($propertyName, $currencyHint));
+    $pass1 = $pass1Result['data'] ?? [];
+    $totalInputTokens += $pass1Result['input_tokens'] ?? 0;
+    $totalOutputTokens += $pass1Result['output_tokens'] ?? 0;
     if (!empty($pass1)) {
         if (!empty($pass1['header']))     $parsedData['header'] = $pass1['header'];
         if (!empty($pass1['room_types'])) $parsedData['room_types'] = $pass1['room_types'];
@@ -119,7 +138,10 @@ try {
             $passNum = $si + 2;
             echo "\n=== PASS {$passNum}/{$totalPasses}: Rates for \"{$season}\" ===\n";
             try {
-                $pass2 = callGeminiPass($imageParts, buildPass2Prompt($propertyName, $currencyHint, $roomNames, [$season]));
+                $pass2Result = callGeminiPass($imageParts, buildPass2Prompt($propertyName, $currencyHint, $roomNames, [$season]));
+                $pass2 = $pass2Result['data'] ?? [];
+                $totalInputTokens += $pass2Result['input_tokens'] ?? 0;
+                $totalOutputTokens += $pass2Result['output_tokens'] ?? 0;
                 if (!empty($pass2) && !empty($pass2['rates'])) {
                     $parsedData['rates'] = array_merge($parsedData['rates'], $pass2['rates']);
                     echo "Got " . count($pass2['rates']) . " rate entries for \"{$season}\"\n";
@@ -139,7 +161,10 @@ try {
         // Fallback: single pass if no seasons extracted
         echo "\n=== PASS 2: Rates (no seasons found, single pass) ===\n";
         try {
-            $pass2 = callGeminiPass($imageParts, buildPass2Prompt($propertyName, $currencyHint, $roomNames, []));
+            $pass2Result = callGeminiPass($imageParts, buildPass2Prompt($propertyName, $currencyHint, $roomNames, []));
+            $pass2 = $pass2Result['data'] ?? [];
+            $totalInputTokens += $pass2Result['input_tokens'] ?? 0;
+            $totalOutputTokens += $pass2Result['output_tokens'] ?? 0;
             if (!empty($pass2) && !empty($pass2['rates'])) {
                 $parsedData['rates'] = $pass2['rates'];
             }
@@ -155,7 +180,10 @@ try {
     $finalPassNum = (!empty($uniqueSeasons) ? count($uniqueSeasons) + 2 : 3);
     echo "\n=== PASS {$finalPassNum}/{$finalPassNum}: Policies, Supplements, Activities ===\n";
     try {
-        $pass3 = callGeminiPass($imageParts, buildPass3Prompt($propertyName, $currencyHint));
+        $pass3Result = callGeminiPass($imageParts, buildPass3Prompt($propertyName, $currencyHint));
+        $pass3 = $pass3Result['data'] ?? [];
+        $totalInputTokens += $pass3Result['input_tokens'] ?? 0;
+        $totalOutputTokens += $pass3Result['output_tokens'] ?? 0;
         if (!empty($pass3)) {
             $pass3Sections = ['child_policies', 'special_supplements', 'cancellation_policies',
                               'activities', 'park_fees', 'policies'];
@@ -166,6 +194,23 @@ try {
         }
     } catch (Exception $e) {
         echo "WARN: Policies pass failed: " . $e->getMessage() . " — skipping\n";
+    }
+
+    // Calculate and deduct wallet cost
+    $actualCost = calculateGeminiCost($totalInputTokens, $totalOutputTokens, $pdo);
+    echo "\n=== WALLET: Total tokens — input: {$totalInputTokens}, output: {$totalOutputTokens}, cost: $" . number_format($actualCost, 4) . " ===\n";
+    try {
+        $walletPdo = reconnectDB(); // Fresh connection for wallet transaction
+        $newBalance = deductWallet($walletPdo, $branchId, $userId, $actualCost,
+            "AI extraction: {$contract['property_name']} ({$pageCount} pages, " . ($totalInputTokens + $totalOutputTokens) . " tokens)",
+            'contract_extraction', $contractId, $totalInputTokens, $totalOutputTokens);
+        if ($newBalance === false) {
+            echo "WARNING: Insufficient wallet balance for deduction. Extraction data saved but not billed.\n";
+        } else {
+            echo "Wallet deducted: $" . number_format($actualCost, 4) . ", new balance: $" . number_format($newBalance, 4) . "\n";
+        }
+    } catch (Exception $e) {
+        echo "WARNING: Wallet deduction failed: " . $e->getMessage() . " — extraction continues\n";
     }
 
     // Clean up temp images
@@ -584,6 +629,12 @@ function callGeminiPass($imageParts, $promptText) {
 
     $result = json_decode($response, true);
 
+    // Extract usage metadata for wallet billing
+    $usageMetadata = $result['usageMetadata'] ?? [];
+    $inputTokens = $usageMetadata['promptTokenCount'] ?? 0;
+    $outputTokens = $usageMetadata['candidatesTokenCount'] ?? 0;
+    echo "Tokens — input: {$inputTokens}, output: {$outputTokens}\n";
+
     // Check for finishReason — detect truncation
     $finishReason = $result['candidates'][0]['finishReason'] ?? 'STOP';
     if ($finishReason === 'MAX_TOKENS') {
@@ -594,7 +645,7 @@ function callGeminiPass($imageParts, $promptText) {
 
     if (empty($content)) {
         echo "WARNING: Gemini returned empty content for this pass\n";
-        return [];
+        return ['data' => [], 'input_tokens' => $inputTokens, 'output_tokens' => $outputTokens];
     }
 
     echo "Raw response length: " . strlen($content) . " chars\n";
@@ -624,7 +675,7 @@ function callGeminiPass($imageParts, $promptText) {
         }
     }
 
-    return $parsed;
+    return ['data' => $parsed, 'input_tokens' => $inputTokens, 'output_tokens' => $outputTokens];
 }
 
 function linkRatesToIds($pdo, $contractId, $rates) {
