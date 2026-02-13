@@ -499,19 +499,60 @@ function findClosestMatch($needle, $map) {
  * Extract text from PDF using available methods
  */
 function extractTextFromPdf($filePath) {
-    // Method 1: pdftotext (poppler-utils) - best for text-based PDFs
+    // Method 1: Smalot PDF Parser (pure PHP, works on Hostinger)
+    $result = trySmalotPdfParser($filePath);
+    if ($result) return $result;
+
+    // Method 2: pdftotext (poppler-utils) - best for text-based PDFs
     $result = tryPdftotext($filePath);
     if ($result) return $result;
 
-    // Method 2: Python pdfplumber (if available) - good for tables
+    // Method 3: Python pdfplumber (if available) - good for tables
     $result = tryPythonPdfExtract($filePath);
     if ($result) return $result;
 
-    // Method 3: Basic PHP PDF parsing (last resort)
+    // Method 4: Basic PHP PDF parsing (last resort)
     $result = tryPhpPdfParse($filePath);
     if ($result) return $result;
 
     return '';
+}
+
+/**
+ * Try Smalot PDF Parser (composer package)
+ */
+function trySmalotPdfParser($filePath) {
+    $autoloadPath = __DIR__ . '/vendor/autoload.php';
+    if (!file_exists($autoloadPath)) return null;
+
+    require_once $autoloadPath;
+
+    if (!class_exists('\\Smalot\\PdfParser\\Parser')) return null;
+
+    try {
+        $parser = new \Smalot\PdfParser\Parser();
+        $pdf = $parser->parseFile($filePath);
+        $text = $pdf->getText();
+
+        // Also try per-page for better structure
+        $pages = $pdf->getPages();
+        if (count($pages) > 1) {
+            $pageTexts = [];
+            foreach ($pages as $i => $page) {
+                $pageText = $page->getText();
+                if (!empty(trim($pageText))) {
+                    $pageTexts[] = "--- Page " . ($i + 1) . " ---\n" . $pageText;
+                }
+            }
+            if (!empty($pageTexts)) {
+                $text = implode("\n\n", $pageTexts);
+            }
+        }
+
+        return (!empty($text) && strlen($text) > 50) ? $text : null;
+    } catch (Exception $e) {
+        return null;
+    }
 }
 
 /**
