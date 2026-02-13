@@ -21,6 +21,18 @@ $token = jwtEncode([
     'name' => $user['full_name'],
 ]);
 
+// Get active modules for this branch
+$modules = getActiveModules($pdo, $user['branch_id']);
+
+// Get wallet balance
+$walletBalance = 0;
+try {
+    $wStmt = $pdo->prepare("SELECT balance FROM wallet_balances WHERE branch_id = ?");
+    $wStmt->execute([$user['branch_id']]);
+    $wRow = $wStmt->fetch();
+    if ($wRow) $walletBalance = (float)$wRow['balance'];
+} catch (Exception $e) {}
+
 jsonResponse([
     'token' => $token,
     'user' => [
@@ -36,5 +48,7 @@ jsonResponse([
         'branch_currency' => $user['branch_currency'],
         'quote_color' => $user['quote_color'],
         'branch_logo' => $user['branch_logo'],
-    ]
+    ],
+    'modules' => $modules,
+    'wallet_balance' => $walletBalance,
 ]);

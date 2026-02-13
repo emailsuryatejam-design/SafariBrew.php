@@ -19,6 +19,20 @@ $user = $stmt->fetch();
 
 if (!$user) jsonError('User not found', 404);
 
+// Get active modules for this branch
+$modules = getActiveModules($pdo, $user['branch_id']);
+
+// Get wallet balance
+$walletBalance = 0;
+try {
+    $wStmt = $pdo->prepare("SELECT balance FROM wallet_balances WHERE branch_id = ?");
+    $wStmt->execute([$user['branch_id']]);
+    $wRow = $wStmt->fetch();
+    if ($wRow) $walletBalance = (float)$wRow['balance'];
+} catch (Exception $e) {
+    // wallet table may not exist yet — ignore
+}
+
 jsonResponse([
     'user' => [
         'id' => (int)$user['id'],
@@ -45,5 +59,7 @@ jsonResponse([
         'logo_url' => $user['logo_url'],
         'quote_color' => $user['quote_color'],
         'quote_font' => $user['quote_font'],
-    ]
+    ],
+    'modules' => $modules,
+    'wallet_balance' => $walletBalance,
 ]);

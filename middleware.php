@@ -47,3 +47,42 @@ function requireAdmin() {
 function requireSalesOrAbove() {
     return requireRole(['admin', 'sales', 'operations']);
 }
+
+/**
+ * Check if the authenticated user's branch has access to a module.
+ * Module names: core, crm, content, rate_management, quoting, finance, ai_brew
+ */
+function requireModule($module) {
+    $auth = requireAuth();
+    $pdo = getDB();
+
+    // 'core' is always available
+    if ($module === 'core') return $auth;
+
+    $stmt = $pdo->prepare("
+        SELECT 1 FROM branch_modules
+        WHERE branch_id = ? AND module_name = ? AND is_active = 1
+          AND (expires_at IS NULL OR expires_at > NOW())
+    ");
+    $stmt->execute([$auth['branch_id'], $module]);
+
+    if (!$stmt->fetch()) {
+        $moduleName = str_replace('_', ' ', ucfirst($module));
+        jsonError("This feature requires the {$moduleName} module. Please upgrade your plan.", 403);
+    }
+
+    return $auth;
+}
+
+/**
+ * Get list of active modules for a branch.
+ */
+function getActiveModules($pdo, $branchId) {
+    $stmt = $pdo->prepare("
+        SELECT module_name FROM branch_modules
+        WHERE branch_id = ? AND is_active = 1
+          AND (expires_at IS NULL OR expires_at > NOW())
+    ");
+    $stmt->execute([$branchId]);
+    return array_column($stmt->fetchAll(), 'module_name');
+}
