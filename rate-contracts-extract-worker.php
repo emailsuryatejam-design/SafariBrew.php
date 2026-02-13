@@ -4,7 +4,12 @@
  * Usage: php rate-contracts-extract-worker.php <contract_id> <user_id>
  *
  * Launched by rate-contracts-extract.php via nohup.
- * Converts PDF pages to images, sends to Gemini Vision, saves to DB.
+ * Converts PDF pages to images, sends to Gemini Vision in 3 PASSES, saves to DB.
+ *
+ * CHUNKED EXTRACTION — 3 passes to avoid token-limit truncation:
+ *   Pass 1: header + room_types + seasons          (~small output)
+ *   Pass 2: rates (room × season matrix)            (~large output)
+ *   Pass 3: policies, supplements, activities, etc.  (~medium output)
  */
 
 // CLI only
@@ -25,7 +30,7 @@ if (!$contractId) {
     exit(1);
 }
 
-set_time_limit(300); // 5 minutes max
+set_time_limit(600); // 10 minutes max (3 passes + PDF conversion)
 
 $pdo = getDB();
 
@@ -40,6 +45,10 @@ if (!$contract) {
 }
 
 echo "Starting extraction for contract {$contractId}: {$contract['property_name']}\n";
+
+// Update status to show progress
+$pdo->prepare("UPDATE rate_contracts SET extraction_status = 'processing' WHERE id = ?")
+    ->execute([$contractId]);
 
 try {
     // ----- Step 1: Locate the PDF file -----
@@ -74,9 +83,52 @@ try {
 
     echo "Converted " . count($pageImages) . " pages to images\n";
 
-    // ----- Step 3: Call Gemini Vision AI -----
-    echo "Sending " . count($pageImages) . " page images to Gemini Vision...\n";
-    $parsedData = callGeminiVisionExtraction($pageImages, $contract);
+    // Prepare base64-encoded image parts (shared across all passes)
+    $imageParts = prepareImageParts($pageImages);
+
+    // ----- Step 3: MULTI-PASS EXTRACTION -----
+    $parsedData = [];
+    $propertyName = $contract['property_name'] ?? 'Unknown';
+    $currencyHint = $contract['currency'] ?? 'USD';
+
+    // ===== PASS 1: Header + Room Types + Seasons =====
+    echo "\n=== PASS 1/3: Header, Room Types, Seasons ===\n";
+    $pass1 = callGeminiPass($imageParts, buildPass1Prompt($propertyName, $currencyHint));
+    if (!empty($pass1)) {
+        if (!empty($pass1['header']))     $parsedData['header'] = $pass1['header'];
+        if (!empty($pass1['room_types'])) $parsedData['room_types'] = $pass1['room_types'];
+        if (!empty($pass1['seasons']))    $parsedData['seasons'] = $pass1['seasons'];
+        echo "Pass 1 done: " . implode(', ', array_keys($pass1)) . "\n";
+    }
+
+    // Brief pause to avoid rate limiting
+    sleep(3);
+
+    // ===== PASS 2: Rates (the big one) =====
+    echo "\n=== PASS 2/3: Rates ===\n";
+    // Feed room_types and seasons from Pass 1 so rates match exactly
+    $roomNames = array_column($parsedData['room_types'] ?? [], 'room_name');
+    $seasonNames = array_column($parsedData['seasons'] ?? [], 'season_name');
+    $pass2 = callGeminiPass($imageParts, buildPass2Prompt($propertyName, $currencyHint, $roomNames, $seasonNames));
+    if (!empty($pass2)) {
+        if (!empty($pass2['rates'])) $parsedData['rates'] = $pass2['rates'];
+        echo "Pass 2 done: " . count($parsedData['rates'] ?? []) . " rate entries\n";
+    }
+
+    // Brief pause
+    sleep(3);
+
+    // ===== PASS 3: Policies, Supplements, Activities, Park Fees =====
+    echo "\n=== PASS 3/3: Policies, Supplements, Activities ===\n";
+    $pass3 = callGeminiPass($imageParts, buildPass3Prompt($propertyName, $currencyHint));
+    if (!empty($pass3)) {
+        $pass3Sections = ['child_policies', 'special_supplements', 'cancellation_policies',
+                          'activities', 'park_fees', 'policies'];
+        foreach ($pass3Sections as $sec) {
+            if (!empty($pass3[$sec])) $parsedData[$sec] = $pass3[$sec];
+        }
+        echo "Pass 3 done: " . implode(', ', array_intersect_key(array_flip($pass3Sections), $pass3)) . "\n";
+    }
 
     // Clean up temp images
     foreach ($pageImages as $img) {
@@ -84,10 +136,10 @@ try {
     }
 
     if (empty($parsedData) || !is_array($parsedData)) {
-        throw new Exception('Gemini returned empty or invalid data');
+        throw new Exception('All extraction passes returned empty data');
     }
 
-    echo "Gemini returned data with sections: " . implode(', ', array_keys($parsedData)) . "\n";
+    echo "\nAll passes complete. Sections: " . implode(', ', array_keys($parsedData)) . "\n";
 
     // ----- Step 4: Save extraction raw data -----
     $pdo->prepare("UPDATE rate_contracts SET extraction_raw = ?, extraction_status = 'completed' WHERE id = ?")
@@ -183,16 +235,17 @@ try {
     // Audit log
     $pdo->prepare("INSERT INTO contract_audit_log (contract_id, user_id, action, details) VALUES (?, ?, 'ai_extracted', ?)")
         ->execute([$contractId, $userId, json_encode([
-            'engine' => 'gemini-2.0-flash-vision',
+            'engine' => 'gemini-2.0-flash-vision-chunked',
             'sections' => $savedSections,
             'pages_processed' => count($pageImages),
+            'passes' => 3,
         ])]);
 
     // Update contract status
     $pdo->prepare("UPDATE rate_contracts SET status = 'extracted' WHERE id = ?")
         ->execute([$contractId]);
 
-    echo "DONE! Saved: " . implode(', ', $savedSections) . "\n";
+    echo "\nDONE! Saved: " . implode(', ', $savedSections) . "\n";
 
 } catch (Exception $e) {
     echo "ERROR: " . $e->getMessage() . "\n";
@@ -239,7 +292,6 @@ function convertPdfToImages($pdfPath) {
     for ($i = 0; $i < $maxPages; $i++) {
         $page = new Imagick();
         $page->setResolution(200, 200);
-        // Read specific page: file.pdf[0], file.pdf[1], etc.
         $page->readImage($pdfPath . '[' . $i . ']');
         $page->setImageFormat('png');
         $page->setImageCompressionQuality(85);
@@ -264,44 +316,36 @@ function convertPdfToImages($pdfPath) {
     return $images;
 }
 
-function callGeminiVisionExtraction($pageImages, $contract) {
-    $apiKey = defined('GEMINI_API_KEY') ? GEMINI_API_KEY : '';
-    if (empty($apiKey)) throw new Exception('Gemini API key not configured');
-
-    $endpoint = defined('GEMINI_ENDPOINT') ? GEMINI_ENDPOINT : '';
-    if (empty($endpoint)) throw new Exception('Gemini endpoint not configured');
-
+/**
+ * Prepare base64-encoded image parts for Gemini API (reused across passes)
+ */
+function prepareImageParts($pageImages) {
     $parts = [];
-
-    // Add page images (limit to 20 pages)
     $maxPages = min(count($pageImages), 20);
     for ($i = 0; $i < $maxPages; $i++) {
         $imageData = file_get_contents($pageImages[$i]);
         if ($imageData === false) continue;
-
-        $base64 = base64_encode($imageData);
         $parts[] = [
             'inline_data' => [
                 'mime_type' => 'image/png',
-                'data' => $base64,
+                'data' => base64_encode($imageData),
             ]
         ];
-        echo "  Page " . ($i + 1) . ": " . strlen($imageData) . " bytes\n";
     }
+    return $parts;
+}
 
-    $propertyName = $contract['property_name'] ?? 'Unknown';
-    $currencyHint = $contract['currency'] ?? 'USD';
+// ===== PASS PROMPTS =====
 
-    $prompt = <<<PROMPT
-You are a hotel/lodge rate contract data extraction expert. These are pages from a PDF rate contract for "{$propertyName}". Currency hint: {$currencyHint}.
+function buildPass1Prompt($propertyName, $currency) {
+    return <<<PROMPT
+You are a hotel/lodge rate contract data extraction expert. These are pages from a PDF rate contract for "{$propertyName}". Currency hint: {$currency}.
 
-Extract ALL structured data from these pages and return a single JSON object.
-
-Return ONLY valid JSON (no markdown, no explanation) with this exact structure. Omit sections that have no data:
+Extract ONLY the following 3 sections from these pages. Return ONLY valid JSON, no markdown, no explanation.
 
 {
   "header": {
-    "property_name": "hotel/lodge/camp name",
+    "property_name": "hotel/lodge/camp name exactly as written",
     "currency": "3-letter code e.g. USD",
     "validity_start": "YYYY-MM-DD",
     "validity_end": "YYYY-MM-DD",
@@ -327,11 +371,36 @@ Return ONLY valid JSON (no markdown, no explanation) with this exact structure. 
       "notes": null,
       "sort_order": 0
     }
-  ],
+  ]
+}
+
+RULES:
+- Extract EVERY room type and season visible in the document. Be thorough.
+- All dates MUST be YYYY-MM-DD format.
+- Include ALL room/accommodation types, even if only mentioned in rate tables.
+- Include ALL seasons/periods, even if date ranges overlap across years.
+- Return ONLY the JSON object with header, room_types, and seasons.
+PROMPT;
+}
+
+function buildPass2Prompt($propertyName, $currency, $roomNames, $seasonNames) {
+    $roomList = !empty($roomNames) ? implode(', ', array_map(function($r) { return '"' . $r . '"'; }, $roomNames)) : '(extract from document)';
+    $seasonList = !empty($seasonNames) ? implode(', ', array_map(function($s) { return '"' . $s . '"'; }, $seasonNames)) : '(extract from document)';
+
+    return <<<PROMPT
+You are a hotel/lodge rate contract data extraction expert. These are pages from a PDF rate contract for "{$propertyName}". Currency hint: {$currency}.
+
+Extract ONLY the RATES section from these pages. Return ONLY valid JSON, no markdown, no explanation.
+
+The room types already extracted are: [{$roomList}]
+The seasons already extracted are: [{$seasonList}]
+
+Return this structure:
+{
   "rates": [
     {
-      "room_name": "MUST exactly match a room_types entry",
-      "season_name": "MUST exactly match a seasons entry",
+      "room_name": "MUST exactly match one of the room types listed above",
+      "season_name": "MUST exactly match one of the seasons listed above",
       "meal_plan": "RO|BB|HB|FB|AI",
       "rate_pps": null,
       "rate_single": null,
@@ -342,11 +411,33 @@ Return ONLY valid JSON (no markdown, no explanation) with this exact structure. 
       "rate_single_supplement": null,
       "rate_extra_bed": null,
       "rate_extra_adult": null,
-      "currency": "USD",
+      "currency": "{$currency}",
       "min_nights": null,
       "notes": null
     }
-  ],
+  ]
+}
+
+CRITICAL RULES:
+- Read ALL rate tables carefully — every row/column combination is a rate entry.
+- Create one rate entry for EACH room + season + meal_plan combination.
+- All monetary values MUST be numbers without currency symbols or commas.
+- room_name MUST EXACTLY match one of: [{$roomList}]
+- season_name MUST EXACTLY match one of: [{$seasonList}]
+- If rates are "per person sharing" (pps/ppps/pppn), use rate_pps field.
+- If rates are per room, use rate_single / rate_double fields.
+- Do NOT skip any rate entries. Extract every single rate from every table.
+- Return ONLY the JSON object with the rates array.
+PROMPT;
+}
+
+function buildPass3Prompt($propertyName, $currency) {
+    return <<<PROMPT
+You are a hotel/lodge rate contract data extraction expert. These are pages from a PDF rate contract for "{$propertyName}". Currency hint: {$currency}.
+
+Extract ONLY the following sections from these pages (skip any that have no data). Return ONLY valid JSON, no markdown, no explanation.
+
+{
   "child_policies": [
     { "age_from": 0, "age_to": 5, "policy_type": "free|percentage|fixed", "sharing_with_1_adult": null, "sharing_with_2_adults": null, "own_room": null, "fixed_rate": null, "max_children_per_room": null, "currency": null, "notes": null }
   ],
@@ -367,26 +458,33 @@ Return ONLY valid JSON (no markdown, no explanation) with this exact structure. 
   ]
 }
 
-CRITICAL RULES:
-- Extract EVERY rate, room type, season, and policy visible in these pages. Be thorough.
-- Read ALL tables carefully — every row/column combination is a rate entry.
-- All dates MUST be YYYY-MM-DD format.
+RULES:
+- Extract EVERY policy, supplement, activity, park fee visible in the document.
 - All monetary values MUST be numbers without currency symbols or commas.
-- room_name in rates MUST EXACTLY match a room_name in room_types.
-- season_name in rates MUST EXACTLY match a season_name in seasons.
-- If rates are "per person sharing" (pps/ppps/pppn), use rate_pps field.
-- If rates are per room, use rate_single / rate_double fields.
-- Create one rate entry for EACH room + season combination.
+- All dates MUST be YYYY-MM-DD format.
+- Omit sections that have absolutely no data in the document.
 - Return ONLY the JSON object.
 PROMPT;
+}
 
-    $parts[] = ['text' => $prompt];
+// ===== GEMINI API CALL (single pass) =====
+
+function callGeminiPass($imageParts, $promptText) {
+    $apiKey = defined('GEMINI_API_KEY') ? GEMINI_API_KEY : '';
+    if (empty($apiKey)) throw new Exception('Gemini API key not configured');
+
+    $endpoint = defined('GEMINI_ENDPOINT') ? GEMINI_ENDPOINT : '';
+    if (empty($endpoint)) throw new Exception('Gemini endpoint not configured');
+
+    // Build parts: images + prompt
+    $parts = $imageParts;
+    $parts[] = ['text' => $promptText];
 
     $payload = json_encode([
         'contents' => [['parts' => $parts]],
         'generationConfig' => [
             'temperature' => 0.1,
-            'maxOutputTokens' => 16384,
+            'maxOutputTokens' => 32768,
             'responseMimeType' => 'application/json',
         ],
     ]);
@@ -423,7 +521,7 @@ PROMPT;
         if ($curlError) throw new Exception("Gemini API connection error: {$curlError}");
 
         if ($httpCode === 429 && $attempt < $maxRetries) {
-            $wait = $attempt * 15;
+            $wait = $attempt * 20; // Longer wait between passes
             echo "Rate limited — waiting {$wait}s before retry...\n";
             sleep($wait);
             continue;
@@ -439,10 +537,23 @@ PROMPT;
     }
 
     $result = json_decode($response, true);
+
+    // Check for finishReason — detect truncation
+    $finishReason = $result['candidates'][0]['finishReason'] ?? 'STOP';
+    if ($finishReason === 'MAX_TOKENS') {
+        echo "WARNING: Gemini hit token limit (finishReason=MAX_TOKENS). Response may be truncated.\n";
+    }
+
     $content = $result['candidates'][0]['content']['parts'][0]['text'] ?? '';
 
-    if (empty($content)) throw new Exception('Gemini returned an empty response');
+    if (empty($content)) {
+        echo "WARNING: Gemini returned empty content for this pass\n";
+        return [];
+    }
 
+    echo "Raw response length: " . strlen($content) . " chars\n";
+
+    // Parse JSON with fallbacks
     $parsed = json_decode($content, true);
 
     if (json_last_error() !== JSON_ERROR_NONE) {
@@ -456,13 +567,12 @@ PROMPT;
                 $parsed = json_decode($m[0], true);
             }
         }
-        // Try repairing common JSON issues (trailing commas, unescaped newlines)
+        // Try repairing common JSON issues
         if (json_last_error() !== JSON_ERROR_NONE) {
             $repaired = repairJson($content);
             $parsed = json_decode($repaired, true);
         }
         if (json_last_error() !== JSON_ERROR_NONE) {
-            // Save raw response for debugging
             echo "RAW GEMINI RESPONSE (first 2000 chars):\n" . substr($content, 0, 2000) . "\n";
             throw new Exception('Invalid JSON from Gemini: ' . json_last_error_msg());
         }
@@ -565,7 +675,5 @@ function repairJson($text) {
     $text = preg_replace('/[\x00-\x1f](?=[^"]*"[^"]*(?:"[^"]*"[^"]*)*$)/', ' ', $text);
     // Remove BOM
     $text = preg_replace('/^\xEF\xBB\xBF/', '', $text);
-    // Fix common Gemini issue: numbers with currency symbols e.g. "$150" -> 150
-    // (only inside JSON values, not in string fields - skip this, too risky)
     return $text;
 }
