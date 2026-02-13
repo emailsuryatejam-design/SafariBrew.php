@@ -222,34 +222,44 @@ function convertPdfToImages($pdfPath) {
     $prefix = 'rcpg_' . uniqid() . '_';
     $images = [];
 
+    // Read PDF to get page count
     $im = new Imagick();
-    $im->setResolution(200, 200); // 200 DPI before reading
+    $im->setResolution(200, 200);
     $im->readImage($pdfPath);
-
     $pageCount = $im->getNumberImages();
+    $im->clear();
+    $im->destroy();
+
     echo "PDF has {$pageCount} pages\n";
 
     // Limit to 20 pages
     $maxPages = min($pageCount, 20);
 
+    // Convert each page individually to avoid mergeImageLayers issues
     for ($i = 0; $i < $maxPages; $i++) {
-        $im->setIteratorIndex($i);
-        $im->setImageFormat('png');
-        $im->setImageCompressionQuality(85);
+        $page = new Imagick();
+        $page->setResolution(200, 200);
+        // Read specific page: file.pdf[0], file.pdf[1], etc.
+        $page->readImage($pdfPath . '[' . $i . ']');
+        $page->setImageFormat('png');
+        $page->setImageCompressionQuality(85);
 
         // Flatten to remove alpha/transparency (white background)
-        $im->setImageBackgroundColor('white');
-        $im->setImageAlphaChannel(Imagick::ALPHACHANNEL_REMOVE);
-        $im->mergeImageLayers(Imagick::LAYERMETHOD_FLATTEN);
+        $page->setImageBackgroundColor('white');
+        $page->setImageAlphaChannel(Imagick::ALPHACHANNEL_REMOVE);
+        $flat = $page->mergeImageLayers(Imagick::LAYERMETHOD_FLATTEN);
 
         $pageFile = sprintf("{$tmpDir}/{$prefix}%03d.png", $i + 1);
-        $im->writeImage($pageFile);
+        $flat->writeImage($pageFile);
         $images[] = $pageFile;
+
+        $flat->clear();
+        $flat->destroy();
+        $page->clear();
+        $page->destroy();
+
         echo "  Page " . ($i + 1) . ": " . filesize($pageFile) . " bytes\n";
     }
-
-    $im->clear();
-    $im->destroy();
 
     return $images;
 }
