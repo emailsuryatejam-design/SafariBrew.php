@@ -95,7 +95,9 @@ if ($method === 'POST') {
 
         $code = generateCode('REQ', $pdo, 'requests', 'request_code');
 
-        $stmt = $pdo->prepare("INSERT INTO requests (branch_id, client_id, request_code, status, travel_start, travel_end, pax_adults, pax_children, pax_babies, countries, destinations, tour_type, source, assigned_user_id, budget_currency, budget_amount, notes) VALUES (?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        $tourPlan = isset($data['tour_plan']) ? json_encode($data['tour_plan']) : null;
+
+        $stmt = $pdo->prepare("INSERT INTO requests (branch_id, client_id, request_code, status, travel_start, travel_end, pax_adults, pax_children, pax_babies, countries, destinations, tour_type, source, assigned_user_id, budget_currency, budget_amount, notes, tour_plan) VALUES (?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         $stmt->execute([
             $bid,
             $clientId,
@@ -113,6 +115,7 @@ if ($method === 'POST') {
             $data['budget_currency'] ?? 'USD',
             $data['budget_amount'] ?? null,
             $data['notes'] ?? null,
+            $tourPlan,
         ]);
 
         $requestId = (int)$pdo->lastInsertId();

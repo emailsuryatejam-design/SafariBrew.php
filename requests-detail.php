@@ -66,6 +66,12 @@ if ($method === 'PUT') {
         }
     }
 
+    // Handle tour_plan separately (JSON field)
+    if (array_key_exists('tour_plan', $data)) {
+        $fields[] = "tour_plan = ?";
+        $params[] = $data['tour_plan'] !== null ? json_encode($data['tour_plan']) : null;
+    }
+
     if (!empty($data['countries'])) {
         $fields[] = "countries = ?";
         $params[] = json_encode($data['countries']);
