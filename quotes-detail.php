@@ -14,7 +14,7 @@ if ($method === 'GET') {
     $stmt = $pdo->prepare("
         SELECT q.*,
                r.request_code, r.travel_start, r.travel_end, r.pax_adults, r.pax_children, r.pax_babies,
-               r.countries, r.destinations, r.tour_type, r.client_id,
+               r.countries, r.destinations, r.tour_type, r.client_id, r.tour_plan,
                c.first_name, c.last_name, c.email as client_email, c.phone as client_phone, c.country as client_country,
                u.full_name as created_by_name
         FROM quotes q
